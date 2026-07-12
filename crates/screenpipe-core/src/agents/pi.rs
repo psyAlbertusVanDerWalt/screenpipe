@@ -1205,7 +1205,19 @@ impl PiExecutor {
         cmd.arg("--provider").arg(resolved_provider);
         cmd.arg("--model").arg(model);
         if let Some(sys) = pipe_system_prompt {
-            cmd.arg("--append-system-prompt").arg(sys);
+            // Anthropic gets --append-system-prompt (appends after pi's own
+            // generic "you are a coding assistant" preamble) to keep that
+            // preamble a stable, cacheable prefix. Every other provider gets
+            // --system-prompt (full replace) — pi's generic coding-assistant
+            // framing isn't relevant to a pipe's job in the first place, and
+            // weaker/local models were observed losing track of the pipe's
+            // actual instructions when they're appended after a differently-
+            // themed preamble instead of being the primary framing.
+            if matches!(resolved_provider, "anthropic" | "anthropic-byok") {
+                cmd.arg("--append-system-prompt").arg(sys);
+            } else {
+                cmd.arg("--system-prompt").arg(sys);
+            }
         }
         cmd.arg("-p").arg(prompt);
 
@@ -1337,10 +1349,20 @@ impl PiExecutor {
         }
         cmd.arg("--provider").arg(resolved_provider);
         cmd.arg("--model").arg(model);
-        // Pass pipe instructions as system prompt for Anthropic prompt caching.
-        // Pi's internal system prompt + this appended text form the cached prefix.
+        // Anthropic gets --append-system-prompt (appends after pi's own
+        // generic "you are a coding assistant" preamble) to keep that
+        // preamble a stable, cacheable prefix. Every other provider gets
+        // --system-prompt (full replace) — pi's generic coding-assistant
+        // framing isn't relevant to a pipe's job in the first place, and
+        // weaker/local models were observed losing track of the pipe's
+        // actual instructions when they're appended after a differently-
+        // themed preamble instead of being the primary framing.
         if let Some(sys) = pipe_system_prompt {
-            cmd.arg("--append-system-prompt").arg(sys);
+            if matches!(resolved_provider, "anthropic" | "anthropic-byok") {
+                cmd.arg("--append-system-prompt").arg(sys);
+            } else {
+                cmd.arg("--system-prompt").arg(sys);
+            }
         }
         cmd.arg("-p").arg(prompt);
 
