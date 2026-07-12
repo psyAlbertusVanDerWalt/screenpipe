@@ -13,6 +13,19 @@ use std::sync::Arc;
 
 /// Handle pipe subcommands (standalone — does NOT require a running server).
 pub async fn handle_pipe_command(command: &PipeCommand) -> anyhow::Result<()> {
+    // This CLI path (unlike `record`) never calls the binary's setup_logging,
+    // so `info!`/`warn!`/`error!` calls throughout the pipe executor and agent
+    // spawn code are silently dropped — a `pipe run` hang is otherwise
+    // undebuggable. try_init (not init) so this never panics if a subscriber
+    // somehow already exists.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+
     let pipes_dir = screenpipe_core::paths::default_screenpipe_data_dir().join("pipes");
     std::fs::create_dir_all(&pipes_dir)?;
 
@@ -21,7 +34,12 @@ pub async fn handle_pipe_command(command: &PipeCommand) -> anyhow::Result<()> {
     let mut executors: HashMap<String, Arc<dyn AgentExecutor>> = HashMap::new();
     executors.insert("pi".to_string(), pi);
 
-    let manager = PipeManager::new(pipes_dir.clone(), executors, None, 3030);
+    let mut manager = PipeManager::new(pipes_dir.clone(), executors, None, 3030);
+    // Without this, a pipe run from this standalone CLI path (as opposed to
+    // the running server's own scheduler) never gets SCREENPIPE_LOCAL_API_KEY
+    // in its subprocess env, so every curl call to localhost:3030 the pipe
+    // makes 403s — silently, since `pipe run` has no server log to surface it in.
+    manager.set_local_api_key(crate::auth_key::find_api_auth_key().await);
     manager.load_pipes().await?;
 
     match command {
