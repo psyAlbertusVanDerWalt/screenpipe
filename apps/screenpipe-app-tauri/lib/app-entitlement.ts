@@ -84,14 +84,11 @@ export function isDevBillingBypassEnabled() {
   if (process.env.NEXT_PUBLIC_SCREENPIPE_FORCE_BILLING_GATE === "true") {
     return false;
   }
-  return (
-    process.env.TAURI_ENV_DEBUG === "true" ||
-    process.env.NODE_ENV === "development" ||
-    process.env.NEXT_PUBLIC_SCREENPIPE_DEV_BILLING_BYPASS === "true" ||
-    // e2e builds bypass the paywall by default so the suite exercises real
-    // features; the dedicated gate spec re-enables it via the key above.
-    process.env.NEXT_PUBLIC_SCREENPIPE_E2E === "true"
-  );
+  // This fork runs self-hosted only (no distribution, no screenpipe cloud
+  // account) — the upstream billing gate has no one to check against here,
+  // so it's bypassed unconditionally rather than forcing a login this
+  // deployment will never have. Mirrors the Rust-side app_entitled_or_dev().
+  return true;
 }
 
 // Show the dev-only login helper (paste a token / screenpipe:// URL) when we are
