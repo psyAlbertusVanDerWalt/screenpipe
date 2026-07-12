@@ -2,7 +2,7 @@
 schedule: every day at 2am
 enabled: true
 preset:
-  - ollama-local
+  - ollama-cloud
 permissions: writer
 timeout: 900
 title: Nightly Memory Extraction
