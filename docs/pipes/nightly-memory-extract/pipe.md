@@ -1,5 +1,5 @@
 ---
-schedule: every day at 2am
+schedule: every day at 6pm
 enabled: true
 preset:
   - ollama-cloud
