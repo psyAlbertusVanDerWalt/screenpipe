@@ -1656,18 +1656,27 @@ impl SettingsStore {
         {
             config.port = p;
         }
-        match self.local_plan_policy() {
-            LocalPlanPolicy::VerifiedFree => {
-                config.max_non_template_pipes = Some(2);
-                config.enforce_free_plan_retention = true;
-            }
-            LocalPlanPolicy::Unknown => {
-                // Unknown must never inherit paid/unlimited behavior, but it is
-                // not safe evidence for destructive free-plan retention.
-                config.max_non_template_pipes = Some(2);
-            }
-            LocalPlanPolicy::VerifiedPaid => {}
-        }
+        // LOCAL FORK OVERRIDE — no plan tiering on a self-hosted install.
+        //
+        // Upstream tiers this config by `local_plan_policy()`:
+        //
+        //     LocalPlanPolicy::VerifiedFree => {
+        //         config.max_non_template_pipes = Some(2);
+        //         config.enforce_free_plan_retention = true;
+        //     }
+        //     LocalPlanPolicy::Unknown => {
+        //         config.max_non_template_pipes = Some(2);
+        //     }
+        //     LocalPlanPolicy::VerifiedPaid => {}
+        //
+        // That caps custom pipes at 2 without an account (this install runs 11)
+        // and, on the free tier, enables destructive retention. This build is
+        // fully local — no account, no cloud, no paid service consumed — so it
+        // takes the unrestricted `VerifiedPaid` path: leave `config` untouched,
+        // so all pipes are allowed and nothing auto-deletes captured data.
+        //
+        // Companion to the override in `recording::recording_access_allowed`.
+        // Restore the match above for stock behaviour.
         config
     }
 

@@ -144,7 +144,22 @@ fn recording_access_policy(
 /// Enterprise builds keep their native entitlement guard, and consumer builds
 /// still reject accounts that are required to use an enterprise binary.
 ///
+/// LOCAL FORK OVERRIDE — this build records without a screenpipe account.
+///
+/// Upstream added this gate in d3a08d932 ("feat: add free plan usage limits",
+/// 2026-07-20). It blocks *local* capture on the user's own hardware until an
+/// account is created and verified against screenpipe's servers. This install
+/// is entirely self-hosted — no cloud sync, no remote storage, no paid service
+/// is consumed — so the gate is disabled here deliberately.
+///
+/// Kept as a single early return in this wrapper so `recording_access_policy`
+/// below (and its upstream unit tests) stay untouched and this survives a
+/// rebase as one obvious hunk. Delete this block to restore stock behaviour.
 pub(crate) fn recording_access_allowed(store: &SettingsStore) -> bool {
+    let _ = store;
+    return true;
+
+    #[allow(unreachable_code)]
     recording_access_policy(
         cfg!(feature = "enterprise-build"),
         cfg!(debug_assertions),
