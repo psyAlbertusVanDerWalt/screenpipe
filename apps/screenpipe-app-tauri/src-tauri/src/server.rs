@@ -126,7 +126,113 @@ async fn handle_focus(
     }))
 }
 
-async fn kill_process_on_port(port: u16) {
+/// Liveness probe for the control server. Deliberately trivial and side-effect
+/// free: [`kill_process_on_port`] calls this against whoever currently owns the
+/// port to decide whether it is a live sibling (spare it) or a zombie (reclaim
+/// the port). Every other route on this router either mutates window state or
+/// does real work, so none of them are safe to poll.
+async fn handle_health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "ok",
+        "pid": std::process::id(),
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+/// Windows image names we are ever willing to force-kill to reclaim a port.
+/// `screenpipe.exe` is the CLI/engine sidecar; the GUI itself is handled
+/// separately and only when it has already failed a health probe.
+#[cfg(windows)]
+const SIDECAR_IMAGE_NAMES: &[&str] = &["screenpipe.exe"];
+
+/// Extract the PIDs *listening* on `port` from `netstat -ano` output.
+///
+/// The old implementation took `line.split_whitespace().last()` on every line
+/// matching `:{port}`, which also matches rows where `port` is the **remote**
+/// port — i.e. any client currently connected to our own server. That made the
+/// browser extension, or any local process talking to screenpipe, a valid
+/// taskkill target. Only `TCP ... LISTENING` rows whose *local* address ends in
+/// `:{port}` identify the owner of the port.
+#[cfg(windows)]
+pub(crate) fn parse_listening_pids(netstat_output: &str, port: u16) -> Vec<u32> {
+    let suffix = format!(":{}", port);
+    let mut pids: Vec<u32> = netstat_output
+        .lines()
+        .filter_map(|line| {
+            // TCP  <local addr>  <remote addr>  LISTENING  <pid>
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 5 {
+                return None;
+            }
+            if !fields[0].eq_ignore_ascii_case("tcp") {
+                return None;
+            }
+            if !fields[3].eq_ignore_ascii_case("listening") {
+                return None;
+            }
+            if !fields[1].ends_with(&suffix) {
+                return None;
+            }
+            fields[4].parse::<u32>().ok()
+        })
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// Resolve a PID to its image name via `tasklist`. Returns `None` when the
+/// process is gone or the query fails — callers treat that as "don't kill".
+#[cfg(windows)]
+async fn image_name_for_pid(pid: u32) -> Option<String> {
+    let mut cmd = tokio::process::Command::new("cmd");
+    cmd.args([
+        "/C",
+        &format!("tasklist /FI \"PID eq {}\" /NH /FO CSV", pid),
+    ]);
+    {
+        #[allow(unused_imports)]
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd.output().await.ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // CSV: "image.exe","1234","Console","1","12,345 K"
+    let first = text.lines().find(|l| l.starts_with('"'))?;
+    Some(first.split('"').nth(1)?.to_ascii_lowercase())
+}
+
+/// Reclaim `port` from a genuinely dead predecessor.
+///
+/// **This function used to cause the exact outage it was written to prevent.**
+/// When two copies of the app started together at logon (two `Run` keys, and a
+/// single-instance check that both raced past), the second one found the first
+/// one's listener, labelled it an "orphaned process", and `taskkill /F`'d a
+/// fully healthy sibling mid-write — surfacing to the user as a random crash,
+/// and corrupting `store.bin` on the way out. See the boot-time mutex gate in
+/// `main.rs`, which is the primary fix; this is defence in depth.
+///
+/// The rules now are:
+///   1. If something answers `health_url`, a live screenpipe owns this port.
+///      Never kill it — back off and let the caller's bind-retry loop decide.
+///   2. Only ever kill our own GUI image (and only after rule 1 has proven it
+///      unresponsive) or a known sidecar. A foreign process that happens to
+///      hold the port — a dev server on 3030, say — is not ours to terminate.
+pub(crate) async fn kill_process_on_port(port: u16, health_url: Option<&str>) {
+    // Rule 1: a responsive owner is a live instance, not an orphan.
+    if let Some(url) = health_url {
+        if probe_port_owner_alive(url).await {
+            tracing::warn!(
+                "port {} is owned by a live, responsive screenpipe instance — refusing to kill it. \
+                 This process is most likely a redundant second launch; it should have exited at \
+                 the single-instance gate.",
+                port
+            );
+            return;
+        }
+    }
+
     #[cfg(unix)]
     {
         let my_pid = std::process::id().to_string();
@@ -190,6 +296,11 @@ async fn kill_process_on_port(port: u16) {
     #[cfg(windows)]
     {
         let my_pid_num: u32 = std::process::id();
+        let my_image = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()))
+            .unwrap_or_else(|| "screenpipe-app.exe".to_string());
+
         let mut netstat_cmd = tokio::process::Command::new("cmd");
         netstat_cmd.args(["/C", &format!("netstat -ano | findstr :{}", port)]);
         {
@@ -201,18 +312,47 @@ async fn kill_process_on_port(port: u16) {
         if let Ok(output) = netstat_cmd.output().await {
             if output.status.success() {
                 let text = String::from_utf8_lossy(&output.stdout);
-                let mut pids = std::collections::HashSet::new();
-                for line in text.lines() {
-                    if let Some(pid_str) = line.split_whitespace().last() {
-                        if let Ok(pid) = pid_str.parse::<u32>() {
-                            if pid != 0 && pid != my_pid_num {
-                                pids.insert(pid);
-                            }
+                let pids: Vec<u32> = parse_listening_pids(&text, port)
+                    .into_iter()
+                    .filter(|pid| *pid != 0 && *pid != my_pid_num)
+                    .collect();
+
+                let mut killed_any = false;
+                for pid in pids {
+                    let image = match image_name_for_pid(pid).await {
+                        Some(i) => i,
+                        None => {
+                            tracing::warn!(
+                                "port {}: could not identify process {} — leaving it alone",
+                                port,
+                                pid
+                            );
+                            continue;
                         }
+                    };
+
+                    let is_our_gui = image == my_image;
+                    let is_sidecar = SIDECAR_IMAGE_NAMES.contains(&image.as_str());
+
+                    if !is_our_gui && !is_sidecar {
+                        // Someone else's server. Killing it was never our right —
+                        // this used to terminate any unrelated process holding 3030.
+                        tracing::warn!(
+                            "port {} is held by a foreign process {} (pid {}) — not killing it; \
+                             screenpipe will fall back to its bind-retry loop",
+                            port,
+                            image,
+                            pid
+                        );
+                        continue;
                     }
-                }
-                for pid in &pids {
-                    tracing::warn!("killing orphaned process {} on port {}", pid, port);
+
+                    tracing::warn!(
+                        "reclaiming port {} from unresponsive {} (pid {})",
+                        port,
+                        image,
+                        pid
+                    );
                     let mut kill_cmd = tokio::process::Command::new("cmd");
                     kill_cmd.args(["/C", &format!("taskkill /F /PID {}", pid)]);
                     {
@@ -222,13 +362,29 @@ async fn kill_process_on_port(port: u16) {
                         kill_cmd.creation_flags(CREATE_NO_WINDOW);
                     }
                     let _ = kill_cmd.output().await;
+                    killed_any = true;
                 }
-                if !pids.is_empty() {
+                if killed_any {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }
         }
     }
+}
+
+/// Single short probe of whoever owns a port. Intentionally stricter than
+/// `recording::probe_server_health`: this runs on the startup path where a slow
+/// answer still proves the owner is alive, and the only thing we do with the
+/// result is decide *not* to kill something.
+async fn probe_port_owner_alive(health_url: &str) -> bool {
+    matches!(
+        reqwest::Client::new()
+            .get(health_url)
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await,
+        Ok(r) if r.status().is_success()
+    )
 }
 
 /// Loopback hostnames the control server treats as first-party. A `127.0.0.1`
@@ -384,6 +540,7 @@ pub async fn run_server(app_handle: tauri::AppHandle, port: u16) {
             axum::routing::get(list_installed_apps_handler),
         )
         .route("/window-size", axum::routing::post(set_window_size))
+        .route("/health", axum::routing::get(handle_health))
         .route("/focus", axum::routing::post(handle_focus));
 
     let app = with_control_server_boundary(app)
@@ -397,8 +554,10 @@ pub async fn run_server(app_handle: tauri::AppHandle, port: u16) {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
-    // Kill any orphaned process occupying this port from a previous instance
-    kill_process_on_port(port).await;
+    // Reclaim the port only from a dead predecessor. A live instance answering
+    // /health is a sibling, not an orphan, and must survive this.
+    let health_url = format!("http://127.0.0.1:{}/health", port);
+    kill_process_on_port(port, Some(&health_url)).await;
 
     // Retry binding with backoff — avoids panic when a previous instance hasn't
     // released the port yet (e.g. fast restart, TIME_WAIT on Linux).
@@ -731,6 +890,64 @@ curl -X POST http://localhost:11435/notify \
       }'
 
 */
+
+/// Regression tests for the port-reclaim parser.
+///
+/// The bug these guard against took down a live instance: the old code killed
+/// the last numeric field of *any* netstat row mentioning the port, which
+/// includes rows where the port is the remote end of someone else's connection.
+#[cfg(all(test, windows))]
+mod port_reclaim_tests {
+    use super::parse_listening_pids;
+
+    // Real `netstat -ano | findstr :11435` shape, including the rows that made
+    // the old implementation dangerous.
+    const SAMPLE: &str = "\
+  TCP    127.0.0.1:11435        0.0.0.0:0              LISTENING       26828
+  TCP    127.0.0.1:11435        127.0.0.1:54321        ESTABLISHED     26828
+  TCP    127.0.0.1:54321        127.0.0.1:11435        ESTABLISHED     9999
+  TCP    127.0.0.1:54322        127.0.0.1:11435        TIME_WAIT       0
+";
+
+    #[test]
+    fn returns_only_the_listening_owner() {
+        assert_eq!(parse_listening_pids(SAMPLE, 11435), vec![26828]);
+    }
+
+    #[test]
+    fn never_returns_a_client_connected_to_our_port() {
+        // pid 9999 merely *talks to* 11435. Killing it was the old behaviour
+        // and would take out the browser extension or any local API consumer.
+        let pids = parse_listening_pids(SAMPLE, 11435);
+        assert!(!pids.contains(&9999), "client pid must never be a kill target");
+    }
+
+    #[test]
+    fn ignores_rows_for_a_different_port() {
+        assert!(parse_listening_pids(SAMPLE, 3030).is_empty());
+    }
+
+    #[test]
+    fn does_not_match_a_port_that_is_only_a_suffix() {
+        let sample = "  TCP    127.0.0.1:111435       0.0.0.0:0              LISTENING       4242\n";
+        assert!(parse_listening_pids(sample, 1435).is_empty());
+    }
+
+    #[test]
+    fn deduplicates_multiple_listeners() {
+        let sample = "\
+  TCP    127.0.0.1:3030         0.0.0.0:0              LISTENING       777
+  TCP    [::1]:3030             [::]:0                 LISTENING       777
+";
+        assert_eq!(parse_listening_pids(sample, 3030), vec![777]);
+    }
+
+    #[test]
+    fn tolerates_empty_and_malformed_output() {
+        assert!(parse_listening_pids("", 11435).is_empty());
+        assert!(parse_listening_pids("garbage\n\n  TCP  \n", 11435).is_empty());
+    }
+}
 
 #[cfg(test)]
 mod tests {

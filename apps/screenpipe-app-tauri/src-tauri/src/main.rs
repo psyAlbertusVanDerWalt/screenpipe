@@ -265,6 +265,105 @@ where
     args.into_iter().any(|a| a.as_ref() == AUTOSTART_ARG)
 }
 
+/// Stable mutex/lock name for "one screenpipe per data directory".
+///
+/// Keyed on the **data dir**, not the executable path, because the data dir is
+/// what two instances actually fight over — the SQLite db, `store.bin`, the log
+/// file and the WebView2 profile all live there. It also means E2E runs and
+/// dev instances with isolated data dirs never contend with a real install,
+/// with no extra flag to remember.
+fn single_instance_key() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    let mut hasher = DefaultHasher::new();
+    dir.to_string_lossy().to_lowercase().hash(&mut hasher);
+    format!("screenpipe-instance-{:016x}", hasher.finish())
+}
+
+/// Atomic, crash-safe single-instance gate.
+///
+/// Why this exists: the previous gate POSTed to `/focus` and treated a failed
+/// request as "nobody else is running". At logon, when two `Run` entries fire
+/// simultaneously, *neither* process has bound its port yet, so both concluded
+/// they were alone and booted fully. `tauri-plugin-single-instance` did not
+/// save us either — its Windows path calls `FindWindowW` after seeing
+/// `ERROR_ALREADY_EXISTS`, and if the winner has not created its hidden window
+/// yet the lookup returns NULL and the loser silently falls through.
+///
+/// A named mutex has no such window: `CreateMutexW` either creates the object
+/// or reports `ERROR_ALREADY_EXISTS`, atomically, in one syscall. The handle is
+/// held for the life of the process and released by the kernel on exit —
+/// including on a hard crash — so a dead instance can never wedge the next
+/// launch the way a stale lockfile would.
+#[cfg(target_os = "windows")]
+mod single_instance_gate {
+    use std::sync::OnceLock;
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    struct GateHandle(HANDLE);
+    // The handle is only ever created once and deliberately never touched
+    // again; it exists purely to keep the kernel object (and therefore the
+    // name) alive for the process lifetime.
+    unsafe impl Send for GateHandle {}
+    unsafe impl Sync for GateHandle {}
+
+    static GATE: OnceLock<GateHandle> = OnceLock::new();
+
+    /// `true` if this process now owns the gate, `false` if another live
+    /// process already holds it.
+    ///
+    /// Fails **open**: if the mutex API itself errors we return `true` and let
+    /// the app boot. A broken gate must never be the reason screenpipe won't
+    /// start.
+    pub fn claim() -> bool {
+        let name = HSTRING::from(format!("Local\\{}", super::single_instance_key()));
+        unsafe {
+            match CreateMutexW(None, true, &name) {
+                Ok(handle) => {
+                    if GetLastError() == ERROR_ALREADY_EXISTS {
+                        let _ = CloseHandle(handle);
+                        false
+                    } else {
+                        let _ = GATE.set(GateHandle(handle));
+                        true
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "screenpipe: single-instance mutex unavailable ({e}); continuing without the gate"
+                    );
+                    true
+                }
+            }
+        }
+    }
+}
+
+/// Ask an already-running instance to surface itself. Returns `true` when the
+/// hand-off was accepted, meaning this process has done its job and can exit.
+async fn try_focus_handoff(
+    focus_port: u16,
+    args: &[String],
+    deep_link_url: &Option<String>,
+) -> bool {
+    matches!(
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{}/focus", focus_port))
+            .timeout(std::time::Duration::from_secs(2))
+            .json(&serde_json::json!({
+                "args": args,
+                "deep_link_url": deep_link_url,
+            }))
+            .send()
+            .await,
+        Ok(resp) if resp.status().is_success()
+    )
+}
+
 // check if the server is running
 #[tauri::command]
 #[specta::specta]
@@ -471,9 +570,11 @@ async fn main() {
         }
     }
 
-    // Single-instance check: if sidecar server is already listening, hand off and exit.
-    // This covers Linux (where tauri-plugin-single-instance is disabled due to
-    // zbus/tokio conflict) and acts as a fallback on macOS/Windows.
+    // Single-instance gate. Must stay ahead of everything that touches shared
+    // state: the WebView2 profile, the daily log file, store.bin, the SQLite
+    // db and the control port. A second instance that gets past here is not a
+    // cosmetic problem — it used to find the first instance's listener and
+    // `taskkill /F` it as an "orphan" (see server::kill_process_on_port).
     {
         let args: Vec<String> = std::env::args().collect();
         let deep_link_url = args
@@ -485,18 +586,46 @@ async fn main() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(11435);
-        if let Ok(resp) = reqwest::Client::new()
-            .post(format!("http://127.0.0.1:{}/focus", focus_port))
-            .timeout(std::time::Duration::from_secs(2))
-            .json(&serde_json::json!({
-                "args": args,
-                "deep_link_url": deep_link_url,
-            }))
-            .send()
-            .await
-        {
-            if resp.status().is_success() {
-                eprintln!("screenpipe: another instance is already running — focused existing window, exiting.");
+
+        // Non-Windows: the port probe is all we have (Linux has no
+        // single-instance plugin at all, due to the zbus/tokio conflict).
+        // A single attempt is correct here — retrying would re-POST /focus and
+        // emit the deep-link args twice to the running instance.
+        #[cfg(not(target_os = "windows"))]
+        if try_focus_handoff(focus_port, &args, &deep_link_url).await {
+            eprintln!("screenpipe: another instance is already running — focused existing window, exiting.");
+            std::process::exit(0);
+        }
+
+        // Windows: decide the winner atomically, before any port is involved.
+        #[cfg(target_os = "windows")]
+        if !single_instance_gate::claim() {
+            let mut redundant = true;
+
+            // The winner may still be booting and not yet serving /focus, so
+            // retry rather than giving up after one attempt. If the hand-off
+            // never lands, re-test the gate: the holder may since have exited
+            // (e.g. a quit still tearing down), in which case we take over and
+            // boot normally rather than exiting into nothing and leaving the
+            // user with a dead click.
+            for attempt in 0..10u32 {
+                if try_focus_handoff(focus_port, &args, &deep_link_url).await {
+                    eprintln!("screenpipe: another instance is already running — focused existing window, exiting.");
+                    std::process::exit(0);
+                }
+
+                if single_instance_gate::claim() {
+                    eprintln!("screenpipe: previous instance released the single-instance gate — continuing startup.");
+                    redundant = false;
+                    break;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(150 * (attempt as u64 + 1)))
+                    .await;
+            }
+
+            if redundant {
+                eprintln!("screenpipe: another instance owns this data directory but is not responding — exiting rather than running a second copy.");
                 std::process::exit(0);
             }
         }

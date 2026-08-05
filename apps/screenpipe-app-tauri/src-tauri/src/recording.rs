@@ -143,6 +143,7 @@ fn recording_access_policy(
 /// Consumer builds allow signed-in accounts to record on the free plan.
 /// Enterprise builds keep their native entitlement guard, and consumer builds
 /// still reject accounts that are required to use an enterprise binary.
+///
 pub(crate) fn recording_access_allowed(store: &SettingsStore) -> bool {
     recording_access_policy(
         cfg!(feature = "enterprise-build"),
@@ -1036,7 +1037,7 @@ async fn spawn_screenpipe_inner(
     // "start already in progress" guard.
     if tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        kill_process_on_port(port),
+        crate::server::kill_process_on_port(port, Some(&health_url)),
     )
     .await
     .is_err()
@@ -1354,118 +1355,16 @@ async fn start_capture_internal(
 }
 
 // ---------------------------------------------------------------------------
-// Port cleanup (unchanged)
+// Port cleanup
 // ---------------------------------------------------------------------------
-
-async fn kill_process_on_port(port: u16) {
-    #[allow(unused_variables)]
-    let my_pid = std::process::id().to_string();
-
-    #[cfg(unix)]
-    {
-        let child = match tokio::process::Command::new("lsof")
-            .args(["-nP", "-ti", &format!(":{}", port)])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-
-        let child_id = child.id();
-        let output =
-            match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output())
-                .await
-            {
-                Ok(Ok(o)) => o,
-                _ => {
-                    if let Some(pid) = child_id {
-                        let _ = std::process::Command::new("kill")
-                            .args(["-9", &pid.to_string()])
-                            .output();
-                    }
-                    warn!("lsof timed out checking port {}, killed", port);
-                    return;
-                }
-            };
-
-        if output.status.success() {
-            let pids_str = String::from_utf8_lossy(&output.stdout);
-            let pids: Vec<&str> = pids_str
-                .trim()
-                .split('\n')
-                .filter(|s| !s.is_empty() && *s != my_pid)
-                .collect();
-            if pids.is_empty() {
-                debug!("No orphaned processes on port {} (only our own PID)", port);
-                return;
-            }
-            warn!(
-                "Found {} orphaned process(es) on port {}: {:?}. Killing to free port (our pid: {}).",
-                pids.len(), port, pids, my_pid
-            );
-            for pid in &pids {
-                let _ = tokio::process::Command::new("kill")
-                    .args(["-9", pid])
-                    .output()
-                    .await;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            info!("Killed orphaned process(es) on port {}", port);
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        let my_pid_num: u32 = std::process::id();
-        let mut netstat_cmd = tokio::process::Command::new("cmd");
-        netstat_cmd.args(["/C", &format!("netstat -ano | findstr :{}", port)]);
-        {
-            #[allow(unused_imports)]
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            netstat_cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        match netstat_cmd.output().await {
-            Ok(output) if output.status.success() => {
-                let text = String::from_utf8_lossy(&output.stdout);
-                let mut pids = std::collections::HashSet::new();
-                for line in text.lines() {
-                    if let Some(pid) = line.split_whitespace().last() {
-                        if let Ok(pid_num) = pid.parse::<u32>() {
-                            if pid_num > 0 && pid_num != my_pid_num {
-                                pids.insert(pid_num);
-                            }
-                        }
-                    }
-                }
-                if pids.is_empty() {
-                    debug!("No orphaned processes on port {} (only our own PID)", port);
-                    return;
-                }
-                warn!(
-                    "Found {} orphaned process(es) on port {}: {:?}. Killing to free port (our pid: {}).",
-                    pids.len(), port, pids, my_pid_num
-                );
-                for pid in &pids {
-                    let mut kill_cmd = tokio::process::Command::new("taskkill");
-                    kill_cmd.args(["/F", "/PID", &pid.to_string()]);
-                    {
-                        #[allow(unused_imports)]
-                        use std::os::windows::process::CommandExt;
-                        const CREATE_NO_WINDOW: u32 = 0x08000000;
-                        kill_cmd.creation_flags(CREATE_NO_WINDOW);
-                    }
-                    let _ = kill_cmd.output().await;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                info!("Killed orphaned process(es) on port {}", port);
-            }
-            _ => {}
-        }
-    }
-}
+//
+// This module used to carry its own near-identical copy of
+// `kill_process_on_port`, with the same defect as the one in `server.rs`: it
+// took the last whitespace-separated field of every `netstat` line mentioning
+// the port and force-killed it, with no check on what that process actually
+// was. Two copies meant two places to get it wrong, so the hardened version in
+// `server.rs` is now the only implementation — see the safety rules documented
+// there.
 
 #[cfg(test)]
 mod capture_intent_tests {
