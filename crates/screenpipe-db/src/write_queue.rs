@@ -107,6 +107,35 @@ const FATAL_RUN_CLEAR_AFTER: u64 = 3;
 /// the app can escalate further instead of wedging silently forever.
 const PERSISTENT_FAILURE_REFIRE_EVERY: Duration = Duration::from_secs(600);
 
+// ── Sustained-contention wedge recovery ──────────────────────────────────
+//
+// `BatchOutcome::Contention` (SQLite stayed locked past `BUSY_RETRY_BUDGET`)
+// was historically treated as non-escalating: the code assumed a restart
+// "cannot release another SQLite writer" since the lock is presumably held by
+// a separate connection/process that will finish on its own. That holds for
+// genuine external contention, but not when the lock is held by an orphaned
+// in-process task — e.g. a capture task that missed its abort deadline (see
+// vision_manager's "capture task did not finish within 3s after abort, moving
+// on" path, which detaches rather than kills the task). In that case the task
+// never releases the connection, contention never clears, and the write path
+// — and everything downstream of it (HTTP handlers, meeting streaming) — wedges
+// silently for as long as the process runs (2026-07-13 incident: recording
+// engine dark for ~50-80 min, twice, with an in-flight meeting cut off
+// mid-stream both times).
+//
+// A restart DOES fix the in-process-zombie case (it tears down the whole
+// runtime, including the zombie and its held connection), so sustained
+// contention gets its own wall-clock escalation into the same
+// `on_persistent_failure` hook — deliberately wall-clock-only (no count rule)
+// and much longer than the fatal-connection threshold, so a slow-but-healthy
+// WAL checkpoint or a legitimately busy external writer can never trip it.
+
+/// Wall-clock escalation for sustained lock contention. Each `Contention`
+/// batch already represents `BUSY_RETRY_BUDGET` (5s) of failed retries, so
+/// this many consecutive minutes of nothing but contention is far past any
+/// plausible transient lock.
+const PERSISTENT_FAILURE_AFTER_CONTENTION_WALL: Duration = Duration::from_secs(180);
+
 /// Pure escalation state for a fatal run — decides when the persistent-failure
 /// hook fires. Extracted from the drain loop so the count/wall-clock/refire
 /// rules are unit-testable with injected time.
@@ -131,10 +160,21 @@ pub(crate) struct FatalRunEscalation {
 
 impl FatalRunEscalation {
     fn new(persistent_after: u64) -> Self {
+        Self::with_wall(
+            persistent_after,
+            PERSISTENT_FAILURE_AFTER_WALL,
+            PERSISTENT_FAILURE_MIN_FATALS,
+        )
+    }
+
+    /// Like `new`, but with an explicit wall-clock threshold — used by the
+    /// sustained-contention tracker, which needs a longer, wall-clock-only
+    /// window (see PERSISTENT_FAILURE_AFTER_CONTENTION_WALL).
+    fn with_wall(persistent_after: u64, wall: Duration, min_fatals_for_wall: u64) -> Self {
         Self {
             persistent_after,
-            wall: PERSISTENT_FAILURE_AFTER_WALL,
-            min_fatals_for_wall: PERSISTENT_FAILURE_MIN_FATALS,
+            wall,
+            min_fatals_for_wall,
             clear_after: FATAL_RUN_CLEAR_AFTER,
             refire_every: PERSISTENT_FAILURE_REFIRE_EVERY,
             run_started: None,
@@ -888,6 +928,14 @@ async fn drain_loop(
     let mut batch: Vec<PendingWrite> = Vec::with_capacity(MAX_BATCH_SIZE);
     // Count + wall-clock + refire escalation rules (see FatalRunEscalation).
     let mut escalation = FatalRunEscalation::new(persistent_after);
+    // Wall-clock-only escalation for sustained lock contention (see
+    // "Sustained-contention wedge recovery" above). `persistent_after` is
+    // u64::MAX so only the wall-clock rule can ever fire this one.
+    let mut contention_escalation = FatalRunEscalation::with_wall(
+        u64::MAX,
+        PERSISTENT_FAILURE_AFTER_CONTENTION_WALL,
+        PERSISTENT_FAILURE_MIN_FATALS,
+    );
 
     loop {
         // Block until at least one write arrives, then take up to MAX_BATCH_SIZE
@@ -954,10 +1002,20 @@ async fn drain_loop(
                         escalation.consecutive_fatal
                     );
                 }
+                if contention_escalation.consecutive_fatal > 0 {
+                    info!(
+                        "write_queue: write path recovered after {} consecutive contention batch(es)",
+                        contention_escalation.consecutive_fatal
+                    );
+                }
                 health.record_success();
                 if escalation.on_healthy() {
                     health.note_fatal_run_recovered();
                     info!("write_queue: fatal run cleared");
+                }
+                if contention_escalation.on_healthy() {
+                    health.note_fatal_run_recovered();
+                    info!("write_queue: contention run cleared");
                 }
             }
             BatchOutcome::Contention => {
@@ -968,10 +1026,29 @@ async fn drain_loop(
                 );
 
                 // A batch that outlives the five-second lock budget is already
-                // data loss for its caller. Restarting cannot release another
-                // SQLite writer, but this must surface immediately and recover
-                // only after a later successful batch.
+                // data loss for its caller. Restarting cannot release a lock
+                // held by a genuinely separate writer, but this must surface
+                // immediately and recover only after a later successful batch.
                 health.set_degraded();
+
+                // If contention never clears, restart anyway (see "Sustained-
+                // contention wedge recovery" above) — past this wall-clock
+                // threshold it's overwhelmingly more likely to be an orphaned
+                // in-process task holding the lock than real external
+                // contention, and a restart is the only thing that clears that.
+                let now = std::time::Instant::now();
+                if contention_escalation.on_fatal(now) {
+                    health.note_persistent_signal();
+                    error!(
+                        "write_queue: sustained write contention ({} batches over {:?}) — requesting engine restart; a lock held this long is almost certainly an orphaned in-process task, not external contention",
+                        contention_escalation.fatal_in_run,
+                        contention_escalation.run_elapsed(now)
+                    );
+                    let hook = on_persistent_failure.hook();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
             }
             BatchOutcome::FatalConnection => {
                 let now = std::time::Instant::now();
@@ -2830,6 +2907,72 @@ mod tests {
         health.record_success();
         assert!(!health.is_degraded());
         assert_eq!(health.consecutive_contention_batches(), 0);
+    }
+
+    fn contention_esc() -> FatalRunEscalation {
+        FatalRunEscalation::with_wall(
+            u64::MAX,
+            PERSISTENT_FAILURE_AFTER_CONTENTION_WALL,
+            PERSISTENT_FAILURE_MIN_FATALS,
+        )
+    }
+
+    #[test]
+    fn contention_escalation_does_not_fire_before_the_wall_threshold() {
+        // A brief burst of contention (a slow WAL checkpoint, a big batch)
+        // must never trip the restart hook — only the wall-clock rule can
+        // fire here (persistent_after = u64::MAX), and only past the
+        // threshold.
+        let mut e = contention_esc();
+        let t0 = std::time::Instant::now();
+        let just_under = PERSISTENT_FAILURE_AFTER_CONTENTION_WALL.as_secs() - 1;
+        for i in 0..just_under {
+            assert!(
+                !e.on_fatal(t0 + Duration::from_secs(i)),
+                "must not fire before the wall threshold elapses"
+            );
+        }
+    }
+
+    #[test]
+    fn contention_escalation_fires_after_sustained_lock() {
+        // Mirrors escalation_wall_clock_fires_on_sparse_batches, but for the
+        // sustained-contention tracker: a lock that never clears for the full
+        // wall-clock window (2026-07-13 incident: an orphaned in-process
+        // capture task held the write connection for 50-80 minutes with the
+        // process just as wedged as a fatal-connection outage, but Contention
+        // batches never escalated).
+        let mut e = contention_esc();
+        let t0 = std::time::Instant::now();
+        assert!(!e.on_fatal(t0));
+        assert!(!e.on_fatal(t0 + Duration::from_secs(30)));
+        assert!(
+            !e.on_fatal(t0 + Duration::from_secs(60)),
+            "min-fatals met but wall not elapsed"
+        );
+        assert!(
+            e.on_fatal(t0 + PERSISTENT_FAILURE_AFTER_CONTENTION_WALL),
+            "fires once sustained contention spans the wall threshold"
+        );
+        assert!(
+            !e.on_fatal(t0 + PERSISTENT_FAILURE_AFTER_CONTENTION_WALL),
+            "latched — no immediate refire"
+        );
+    }
+
+    #[test]
+    fn contention_escalation_clears_on_a_healthy_batch() {
+        let mut e = contention_esc();
+        let t0 = std::time::Instant::now();
+        e.on_fatal(t0);
+        e.on_fatal(t0 + Duration::from_secs(30));
+        for _ in 0..FATAL_RUN_CLEAR_AFTER {
+            e.on_healthy();
+        }
+        assert!(
+            !e.on_fatal(t0 + PERSISTENT_FAILURE_AFTER_CONTENTION_WALL),
+            "a cleared run must not immediately re-fire from stale elapsed time"
+        );
     }
 
     #[tokio::test]

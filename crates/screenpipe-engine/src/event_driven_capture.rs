@@ -2712,10 +2712,39 @@ async fn do_capture(
         config.walk_timeout_override = Some(decision.timeout);
     }
 
-    let tree_walk_result = tokio::task::spawn_blocking(move || {
-        screenpipe_capture::paired_capture::walk_accessibility_tree(&config)
-    })
-    .await?;
+    // The walker's own deadline (config.effective_walk_timeout()) is
+    // cooperative — checked between UIA fetches — so it can't bound a single
+    // fetch that blocks inside Windows UI Automation itself. UIA calls are a
+    // synchronous cross-process RPC into the target window's message pump;
+    // against an unresponsive/hung target they can block forever with no
+    // OS-level timeout. Without an outer bound here, that leaves this whole
+    // capture task (and the tokio blocking-pool thread under it) stuck
+    // indefinitely — repeated every capture cycle for as long as the same
+    // window stays focused, since stop_monitor()'s abort() can't interrupt a
+    // thread already inside a blocking OS call either. Bound it the same way
+    // the stream-invalidation and focused-metadata spawn_blocking calls above
+    // already are.
+    let walk_timeout_bound = config.effective_walk_timeout() + Duration::from_secs(2);
+    let tree_walk_result = match tokio::time::timeout(
+        walk_timeout_bound,
+        tokio::task::spawn_blocking(move || {
+            screenpipe_capture::paired_capture::walk_accessibility_tree(&config)
+        }),
+    )
+    .await
+    {
+        Ok(join_result) => join_result?,
+        Err(_) => {
+            warn!(
+                "accessibility tree walk exceeded {:?} — target window is likely stuck in a \
+                 blocking UI Automation call; abandoning this walk (the blocking-pool thread \
+                 is leaked, Windows gives no way to cancel an in-flight UIA call) and falling \
+                 back to OCR",
+                walk_timeout_bound
+            );
+            TreeWalkResult::NotFound
+        }
+    };
 
     // If the window was skipped (incognito/private browsing or user filter),
     // bail out entirely — don't OCR the screenshot.

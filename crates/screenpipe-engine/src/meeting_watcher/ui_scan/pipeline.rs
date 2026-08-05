@@ -135,15 +135,36 @@ pub(crate) async fn discover_running_apps(
     };
 
     // 1. Find running meeting app processes (blocking AX calls for native apps)
+    //
+    // Windows UI Automation calls are a synchronous cross-process RPC into the
+    // target window's message pump — against an unresponsive window they can
+    // block forever with no OS-level timeout, and there's no way to cancel an
+    // in-flight call once spawn_blocking has started it. Bound the wait so a
+    // single stuck window doesn't stall this poll loop (and leak a
+    // blocking-pool thread) indefinitely; the leaked thread itself can't be
+    // reclaimed, but subsequent scans aren't blocked on it.
     let profiles_clone = profiles.to_vec();
-    let mut running_apps = tokio::task::spawn_blocking(move || {
-        find_running_meeting_apps(&profiles_clone, tracking.as_ref())
-    })
+    let mut running_apps = match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            find_running_meeting_apps(&profiles_clone, tracking.as_ref())
+        }),
+    )
     .await
-    .unwrap_or_else(|e| {
-        error!("meeting v2: spawn_blocking panicked: {}", e);
-        Vec::new()
-    });
+    {
+        Ok(Ok(apps)) => apps,
+        Ok(Err(e)) => {
+            error!("meeting v2: spawn_blocking panicked: {}", e);
+            Vec::new()
+        }
+        Err(_) => {
+            warn!(
+                "meeting v2: find_running_meeting_apps exceeded 5s — a blocking AX call is \
+                 likely stuck against an unresponsive window; skipping this scan"
+            );
+            Vec::new()
+        }
+    };
 
     // Merge DB browser hints (avoids missing meetings when AX doesn't expose URLs)
     for hint in db_browser_hints {
@@ -198,22 +219,36 @@ pub(crate) async fn scan_running_apps(
     let scanner_clone = scanner.clone();
     let profiles_for_scan = profiles.to_vec();
     let apps_for_scan = running_apps.to_vec();
-    let scan_results: Vec<ScanResult> = tokio::task::spawn_blocking(move || {
-        let mut results = Vec::new();
-        for app in &apps_for_scan {
-            let mut result =
-                scanner_clone.scan_process(app.pid, &profiles_for_scan[app.profile_index]);
-            result.profile_index = app.profile_index;
-            result.app_name = app.app_name.clone();
-            results.push(result);
-        }
-        results
-    })
+    // Same unbounded-UIA-call risk as the running-apps scan above — bound it.
+    let scan_results: Vec<ScanResult> = match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            let mut results = Vec::new();
+            for app in &apps_for_scan {
+                let mut result =
+                    scanner_clone.scan_process(app.pid, &profiles_for_scan[app.profile_index]);
+                result.profile_index = app.profile_index;
+                result.app_name = app.app_name.clone();
+                results.push(result);
+            }
+            results
+        }),
+    )
     .await
-    .unwrap_or_else(|e| {
-        error!("meeting v2: scan spawn_blocking panicked: {}", e);
-        Vec::new()
-    });
+    {
+        Ok(Ok(results)) => results,
+        Ok(Err(e)) => {
+            error!("meeting v2: scan spawn_blocking panicked: {}", e);
+            Vec::new()
+        }
+        Err(_) => {
+            warn!(
+                "meeting v2: AX process scan exceeded 5s — a blocking AX call is likely stuck \
+                 against an unresponsive window; skipping this scan"
+            );
+            Vec::new()
+        }
+    };
 
     debug!(
         "meeting v2: scanned {} apps, {} in call",

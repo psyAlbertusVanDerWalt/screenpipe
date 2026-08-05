@@ -232,19 +232,24 @@ impl SafeMonitor {
     /// On Windows we can't cache XcapMonitor (not Send), so this only updates metadata.
     /// Also stops any persistent WGC session so the next capture_image() re-inits it.
     pub async fn refresh(&mut self) -> Result<()> {
-        // Stop persistent capture so next capture_image() lazy-inits a new session
-        if let Ok(mut guard) = self.persistent_capture.lock() {
-            if let Some(mut capture) = guard.take() {
-                capture.stop();
-            }
-        }
         self.persistent_capture_disabled
             .store(false, Ordering::Relaxed);
         self.persistent_capture_failures.store(0, Ordering::Relaxed);
 
         let monitor_id = self.monitor_id;
+        let persistent = self.persistent_capture.clone();
 
         let refreshed = tokio::task::spawn_blocking(move || -> Result<MonitorData> {
+            // Stop persistent capture (a blocking WinRT/COM call — see
+            // release_capture_stream for why this must never run inline on
+            // an async worker thread) so next capture_image() lazy-inits a
+            // new session.
+            if let Ok(mut guard) = persistent.lock() {
+                if let Some(mut capture) = guard.take() {
+                    capture.stop();
+                }
+            }
+
             let monitor = XcapMonitor::all()
                 .map_err(Error::from)?
                 .into_iter()
@@ -272,16 +277,45 @@ impl SafeMonitor {
         Ok(())
     }
 
+    /// Stops the persistent WGC session so the next `capture_image()` rebuilds
+    /// it. `PersistentCapture::stop()` makes blocking WinRT/COM calls
+    /// (`RemoveFrameArrived`, `RemoveClosed`, `Close()`) with no timeout —
+    /// exactly the calls this is invoked to recover from when the OS callback
+    /// has wedged, so `stop()` can itself hang indefinitely. The stop runs on
+    /// a detached task on `spawn_blocking`'s elastic pool rather than inline
+    /// on the caller's (fixed, shared) async worker thread: 2026-07-13
+    /// incident, a stuck `stop()` here — called synchronously from the async
+    /// capture loop — permanently pinned a shared Tokio worker, and repeated
+    /// occurrences across the small fixed worker pool eventually starved the
+    /// whole engine (HTTP server + DB write queue included) dark for hours
+    /// with no panic or error logged. Fire-and-forget is safe: the next
+    /// `capture_image()` either finds the session already taken by this task
+    /// or takes it itself (both go through the same mutex-guarded `Option`,
+    /// so exactly one caller ever owns and stops a given session).
     pub fn release_capture_stream(&self) {
-        if let Ok(mut guard) = self.persistent_capture.lock() {
-            if let Some(mut capture) = guard.take() {
-                capture.stop();
-                tracing::info!(
-                    "released persistent WGC session for monitor {}",
-                    self.monitor_id
+        let persistent = self.persistent_capture.clone();
+        let monitor_id = self.monitor_id;
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                if let Ok(mut guard) = persistent.lock() {
+                    if let Some(mut capture) = guard.take() {
+                        capture.stop();
+                        tracing::info!(
+                            "released persistent WGC session for monitor {}",
+                            monitor_id
+                        );
+                    }
+                }
+            })
+            .await;
+            if let Err(e) = result {
+                tracing::warn!(
+                    "release_capture_stream: blocking task panicked for monitor {}: {}",
+                    monitor_id,
+                    e
                 );
             }
-        }
+        });
     }
 
     pub fn last_capture_seq(&self) -> Option<u64> {

@@ -237,12 +237,46 @@ impl D3dContext {
         })
     }
 
-    fn lock_context(&self) -> MutexGuard<'_, ()> {
-        // Poison recovery: the guard protects no data, only call ordering; a panic in
-        // one capture path must not permanently disable every other monitor's capture.
-        self.context_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Bounded wait for the context lock. A wedged GPU/driver call (`CopyResource`,
+    /// `Map`) can hold the plain `lock_context()` forever — and because this lock is
+    /// shared across every monitor's `FrameArrived` callback plus all `readback()`
+    /// calls, one stuck call cascades into blocking capture for every monitor, and
+    /// `stop()`'s `Close()` calls (which internally wait for any in-flight
+    /// `FrameArrived` invocation to finish) hang too. 2026-07-14 incident: this
+    /// produced an unbounded pileup of leaked blocking-pool threads (233 threads,
+    /// 2061 handles observed) across repeated wedge-watchdog restarts, eventually
+    /// starving the engine dark again despite the earlier `spawn_blocking` fix.
+    /// On timeout this evicts the device from the shared cache (mirrors
+    /// `invalidate_if_removed`) so the *next* session gets a fresh device + context
+    /// lock, isolated from whatever remains stuck on this one — new captures stop
+    /// queuing up behind a lock that may never free.
+    fn try_lock_context(self: &Arc<Self>, timeout: Duration) -> Result<MutexGuard<'_, ()>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.context_lock.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    return Ok(poisoned.into_inner())
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if Instant::now() >= deadline {
+                let mut cache = shared_d3d_cache();
+                if cache.as_ref().is_some_and(|c| Arc::ptr_eq(c, self)) {
+                    tracing::error!(
+                        "D3D11 context lock stuck for {:?} (GPU/driver call likely wedged); \
+                         evicting shared device so future captures get a fresh one",
+                        timeout
+                    );
+                    *cache = None;
+                }
+                return Err(anyhow!(
+                    "D3D11 context lock timed out after {:?} (GPU/driver likely wedged)",
+                    timeout
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// If the device has been removed (GPU reset, driver update), drop it from the
@@ -362,6 +396,35 @@ fn find_hmonitor(monitor_id: u32) -> Result<HMONITOR> {
         .ok_or_else(|| anyhow!("monitor {} not found for persistent capture", monitor_id))
 }
 
+/// Bounded wait for a plain `std::sync::Mutex`, same give-up-rather-than-wedge-
+/// forever policy as `D3dContext::try_lock_context` — but generic, for the
+/// `LatestFrame`/`staging` mutexes below. 2026-07-15 incident: `store_frame` holds
+/// `latest.0.lock()` across two GPU/WinRT calls `try_lock_context` never covers —
+/// `frame_pool.Recreate()` (display-mode-change path) and `create_texture_like`'s
+/// `CreateTexture2D` — both *before* the context-lock guard even starts. When either
+/// wedges, the plain `.lock()` in `get_latest_image()` (called from
+/// `monitor/windows.rs::capture_image()` while holding the *outer* `persistent`
+/// mutex) and in `stop()` (called while tearing down under that same outer mutex)
+/// both block forever, recreating the exact persistent-mutex-pileup cascade the
+/// 2026-07-14 `context_lock`/`stop()` fixes were built to prevent — just one lock
+/// over. Unlike the shared D3D device, these mutexes are per-session (no cache to
+/// evict), so on timeout the caller decides what "give up" means: skip a frame,
+/// fail a readback, or best-effort teardown.
+fn try_lock_timeout<T>(mutex: &Mutex<T>, timeout: Duration) -> Option<MutexGuard<'_, T>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 struct LatestFrame {
     texture: Option<ID3D11Texture2D>,
     width: u32,
@@ -475,12 +538,12 @@ impl PersistentCapture {
                     );
                     // Drop the cached frame and set the flag *under the frame mutex* so a
                     // waiter mid-predicate-check can't miss the wakeup, then notify.
-                    match closed_latest.0.lock() {
-                        Ok(mut slot) => {
+                    match try_lock_timeout(&closed_latest.0, Duration::from_secs(2)) {
+                        Some(mut slot) => {
                             slot.texture = None;
                             closed_flag.store(true, Ordering::Release);
                         }
-                        Err(_) => closed_flag.store(true, Ordering::Release),
+                        None => closed_flag.store(true, Ordering::Release),
                     }
                     closed_latest.1.notify_all();
                     Ok(())
@@ -593,10 +656,9 @@ impl PersistentCapture {
             .map_err(|e| anyhow!("ContentSize failed: {}", e))?;
         let content_size = (content.Width, content.Height);
 
-        let mut slot = latest
-            .0
-            .lock()
-            .map_err(|_| anyhow!("latest frame mutex poisoned"))?;
+        let mut slot = try_lock_timeout(&latest.0, Duration::from_millis(500)).ok_or_else(|| {
+            anyhow!("latest frame mutex stuck for 500ms (a prior FrameArrived likely wedged in Recreate/CreateTexture2D); dropping this frame")
+        })?;
 
         if content_size != slot.pool_size {
             // Display mode changed (resolution/scaling): recreate the pool at the new
@@ -681,7 +743,7 @@ impl PersistentCapture {
             .cast()
             .map_err(|e| anyhow!("cast source texture to ID3D11Resource failed: {}", e))?;
         {
-            let _context_guard = d3d.lock_context();
+            let _context_guard = d3d.try_lock_context(Duration::from_secs(5))?;
             unsafe { d3d.context.CopyResource(&dst_resource, &src_resource) };
         }
         slot.demand.complete(request_generation);
@@ -715,9 +777,13 @@ impl PersistentCapture {
     fn get_image(&self, timeout: Duration, policy: FrameReadPolicy) -> Result<DynamicImage> {
         let deadline = Instant::now() + timeout;
         let (frame_lock, frame_ready) = &*self.latest;
-        let mut slot = frame_lock
-            .lock()
-            .map_err(|e| anyhow!("frame mutex poisoned: {}", e))?;
+        // Bounded, not `.lock()`: a FrameArrived callback wedged inside Recreate/
+        // CreateTexture2D (see `try_lock_timeout`) can hold this indefinitely, and
+        // this call runs while `monitor/windows.rs::capture_image()` holds the
+        // *outer* `persistent` mutex — an unbounded wait here would wedge every
+        // future capture for this monitor, not just this one call.
+        let mut slot = try_lock_timeout(frame_lock, timeout.min(Duration::from_secs(1)))
+            .ok_or_else(|| anyhow!("frame mutex stuck (a FrameArrived callback likely wedged in a GPU/driver call)"))?;
 
         if self.closed.load(Ordering::Acquire) {
             return Err(anyhow!(
@@ -771,10 +837,8 @@ impl PersistentCapture {
         let mut rgba = vec![0u8; row_bytes * height as usize];
 
         {
-            let mut staging_slot = self
-                .staging
-                .lock()
-                .map_err(|_| anyhow!("staging texture mutex poisoned"))?;
+            let mut staging_slot = try_lock_timeout(&self.staging, Duration::from_secs(5))
+                .ok_or_else(|| anyhow!("staging texture mutex stuck for 5s (a concurrent readback likely wedged in Map/Unmap)"))?;
 
             let needs_new =
                 !matches!(&*staging_slot, Some((_, w, h)) if *w == width && *h == height);
@@ -802,7 +866,7 @@ impl PersistentCapture {
                 .cast()
                 .map_err(|e| anyhow!("cast latest texture to ID3D11Resource failed: {}", e))?;
 
-            let _context_guard = self.d3d.lock_context();
+            let _context_guard = self.d3d.try_lock_context(Duration::from_secs(5))?;
             unsafe {
                 self.d3d.context.CopyResource(&dst_resource, &src_resource);
 
@@ -843,38 +907,82 @@ impl PersistentCapture {
 
     /// Stop the persistent capture session. Idempotent — `Drop` calls it again after
     /// an explicit `stop()` without double-closing.
+    ///
+    /// The actual WinRT teardown calls (`RemoveFrameArrived`, `RemoveClosed`,
+    /// `Close()` x2) run on a detached thread with a bounded wait, rather than
+    /// inline on the caller's thread. 2026-07-14 follow-up incident: `stop()` is
+    /// invoked from `monitor/windows.rs` while holding the outer
+    /// `persistent: Mutex<Option<PersistentCapture>>` — if any of these calls hangs
+    /// (WGC's internal event queue wedging, independent of `context_lock`, which a
+    /// same-day earlier fix already bounded), `stop()` never returns, that mutex is
+    /// held forever, and every subsequent `capture_image()`/`refresh()` for this
+    /// monitor piles up behind it — the same unbounded-thread-pileup pattern one
+    /// layer up. These WinRT objects are free-threaded (`CreateFreeThreaded`,
+    /// `FrameArrived` already fires on WGC's own worker threads) so running their
+    /// teardown from a fresh thread is within their designed usage.
     pub fn stop(&mut self) {
         if self.stopped.swap(true, Ordering::AcqRel) {
             return;
         }
 
-        // Unregister handlers first so their captured Arcs (and the cached GPU
-        // texture they reach) release promptly instead of riding on COM teardown.
-        if let Err(e) = self.frame_pool.RemoveFrameArrived(self.frame_arrived_token) {
-            tracing::debug!("RemoveFrameArrived failed: {:?}", e);
-        }
-        if let Err(e) = self.item.RemoveClosed(self.closed_token) {
-            tracing::debug!("RemoveClosed failed: {:?}", e);
-        }
-        if let Err(e) = self.session.Close() {
-            tracing::warn!("failed to close WGC session: {:?}", e);
-        }
-        if let Err(e) = self.frame_pool.Close() {
-            tracing::warn!("failed to close WGC frame pool: {:?}", e);
+        let frame_pool = self.frame_pool.clone();
+        let item = self.item.clone();
+        let session = self.session.clone();
+        let frame_arrived_token = self.frame_arrived_token;
+        let closed_token = self.closed_token;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Unregister handlers first so their captured Arcs (and the cached GPU
+            // texture they reach) release promptly instead of riding on COM teardown.
+            if let Err(e) = frame_pool.RemoveFrameArrived(frame_arrived_token) {
+                tracing::debug!("RemoveFrameArrived failed: {:?}", e);
+            }
+            if let Err(e) = item.RemoveClosed(closed_token) {
+                tracing::debug!("RemoveClosed failed: {:?}", e);
+            }
+            if let Err(e) = session.Close() {
+                tracing::warn!("failed to close WGC session: {:?}", e);
+            }
+            if let Err(e) = frame_pool.Close() {
+                tracing::warn!("failed to close WGC frame pool: {:?}", e);
+            }
+            let _ = tx.send(());
+        });
+
+        if rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            tracing::error!(
+                "PersistentCapture::stop() WinRT teardown did not complete within 5s \
+                 (likely a wedged WGC/driver call); abandoning the wait so the caller's \
+                 lock releases promptly — the detached thread is left to finish or hang \
+                 on its own"
+            );
         }
 
         // Drop the cached frame and mark closed under the frame mutex (no lost
-        // wakeups), then wake any waiter so it fails fast.
-        match self.latest.0.lock() {
-            Ok(mut slot) => {
+        // wakeups), then wake any waiter so it fails fast. Bounded: if a
+        // FrameArrived callback is wedged holding this lock (see
+        // `try_lock_timeout`), `stop()` is itself running under the outer
+        // `persistent` mutex in monitor/windows.rs — an unbounded wait here would
+        // recreate the exact cascade the 2026-07-14 fix removed from the WinRT
+        // teardown calls above, just on this lock instead. `closed` is set either
+        // way since it's a plain atomic, independent of the lock.
+        match try_lock_timeout(&self.latest.0, Duration::from_secs(2)) {
+            Some(mut slot) => {
                 slot.texture = None;
                 self.closed.store(true, Ordering::Release);
             }
-            Err(_) => self.closed.store(true, Ordering::Release),
+            None => {
+                tracing::error!(
+                    "stop(): latest frame mutex stuck for 2s (FrameArrived likely wedged); \
+                     marking closed without clearing the cached frame"
+                );
+                self.closed.store(true, Ordering::Release);
+            }
         }
         self.latest.1.notify_all();
 
-        if let Ok(mut staging) = self.staging.lock() {
+        if let Some(mut staging) = try_lock_timeout(&self.staging, Duration::from_secs(2)) {
             *staging = None;
         }
 
