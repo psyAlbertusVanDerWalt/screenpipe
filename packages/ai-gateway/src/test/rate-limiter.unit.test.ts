@@ -18,7 +18,7 @@
 import { describe, it, expect } from 'bun:test';
 import { RateLimiter, checkRateLimit } from '../utils/rate-limiter';
 import { isFreeModel, getTierConfig } from '../services/usage-tracker';
-import type { AuthResult, Env, UserTier } from '../types';
+import type { AuthResult, Env, UsageTier, UserTier } from '../types';
 
 // In-memory fake of the RATE_LIMITER Durable Object namespace. One RateLimiter
 // instance per id-name (the device id), so counters persist across calls exactly
@@ -45,6 +45,7 @@ function makeEnv(over: Record<string, unknown> = {}): Env {
 const auth = (tier: UserTier, deviceId = 'dev-1'): AuthResult => ({
 	isValid: true,
 	tier,
+	accountPlan: tier === 'subscribed' ? 'business' : tier === 'logged_in' ? 'free' : 'unknown',
 	deviceId,
 });
 
@@ -65,23 +66,18 @@ async function fire(
 }
 
 describe('isFreeModel — weight-0 models classified as free', () => {
-	it('treats Vertex MaaS + fast models + auto as free', () => {
-		for (const m of [
-			'auto',
-			'glm-5',
-			'glm-4.7',
-			'kimi-k2.5',
-			'gemini-3-flash',
-			'gemini-3.5-flash',
-			'gemini-2.5-flash',
-			'qwen/qwen3.5-flash',
-		]) {
-			expect(isFreeModel(m)).toBe(true);
-		}
+	it('treats only Auto as the hosted weight-0 entry', () => {
+		expect(isFreeModel('auto')).toBe(true);
 	});
 
 	it('treats priced models as NOT free', () => {
-		for (const m of ['gpt-5.5', 'gpt-5.5-pro', 'claude-opus-4-7', 'claude-sonnet-4-5', 'gemini-3-pro', 'claude-fable-5']) {
+		for (const m of ['gpt-5.5', 'gpt-5.6-luna', 'claude-opus-4-7', 'claude-sonnet-5', 'claude-fable-5']) {
+			expect(isFreeModel(m)).toBe(false);
+		}
+	});
+
+	it('does not classify removed model IDs as free before alias normalization', () => {
+		for (const m of ['glm-5', 'gemini-3-flash', 'qwen/qwen3.5-flash']) {
 			expect(isFreeModel(m)).toBe(false);
 		}
 	});
@@ -95,15 +91,51 @@ describe('isFreeModel — weight-0 models classified as free', () => {
 describe('getTierConfig — freeRpm bucket', () => {
 	it('defaults freeRpm well above the paid rpm for every tier', () => {
 		const cfg = getTierConfig();
-		for (const tier of ['anonymous', 'logged_in', 'subscribed'] as UserTier[]) {
+		for (const tier of ['anonymous', 'logged_in', 'subscribed', 'business_max', 'business_ultra'] as UsageTier[]) {
 			expect(cfg[tier].freeRpm).toBeGreaterThan(cfg[tier].rpm);
 		}
 		expect(cfg.logged_in.freeRpm).toBe(120);
+		expect(cfg.business_max).toMatchObject({ dailyQueries: 120, rpm: 120, freeRpm: 480 });
+		expect(cfg.business_ultra).toMatchObject({ dailyQueries: 240, rpm: 240, freeRpm: 960 });
 	});
 
 	it('honors the LIMIT_*_FREE_RPM env override', () => {
 		const cfg = getTierConfig({ LIMIT_LOGGED_IN_FREE_RPM: '200' } as unknown as Env);
 		expect(cfg.logged_in.freeRpm).toBe(200);
+	});
+
+	it('honors Max and Ultra env overrides independently', () => {
+		const cfg = getTierConfig({
+			LIMIT_BUSINESS_MAX_DAILY: '121',
+			LIMIT_BUSINESS_MAX_RPM: '121',
+			LIMIT_BUSINESS_ULTRA_DAILY: '241',
+			LIMIT_BUSINESS_ULTRA_FREE_RPM: '999',
+		} as unknown as Env);
+		expect(cfg.business_max.dailyQueries).toBe(121);
+		expect(cfg.business_max.rpm).toBe(121);
+		expect(cfg.business_ultra.dailyQueries).toBe(241);
+		expect(cfg.business_ultra.freeRpm).toBe(999);
+	});
+
+	it('fails closed to safe defaults for malformed or non-positive overrides', () => {
+		const cfg = getTierConfig({ LIMIT_BUSINESS_MAX_DAILY: '-1', LIMIT_BUSINESS_MAX_RPM: '0', LIMIT_BUSINESS_MAX_FREE_RPM: '120rpm', LIMIT_BUSINESS_ULTRA_DAILY: '1.5', LIMIT_BUSINESS_ULTRA_RPM: '9007199254740993' } as unknown as Env);
+		expect(cfg.business_max).toMatchObject({ dailyQueries: 120, rpm: 120, freeRpm: 480 });
+		expect(cfg.business_ultra).toMatchObject({ dailyQueries: 240, rpm: 240 });
+	});
+});
+
+describe('checkRateLimit — capacity tier separation', () => {
+	it('uses the Max bucket without changing subscribed model access', async () => {
+		const env = makeEnv({ LIMIT_BUSINESS_MAX_RPM: '2' });
+		const a: AuthResult = {
+			...auth('subscribed'),
+			accountPlan: 'business_max',
+			usageTier: 'business_max',
+		};
+		expect((await fire(env, a, { freeModel: false }, 2)).allowed).toBe(true);
+		const over = await checkRateLimit(chatReq(), env, a, { freeModel: false });
+		expect(over.allowed).toBe(false);
+		expect(JSON.stringify(await over.response!.json())).toContain('2 requests per minute');
 	});
 });
 

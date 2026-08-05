@@ -65,15 +65,28 @@ describe("PiExtensionsCard", () => {
     render(<PiExtensionsCard />);
 
     expect(await screen.findByText("Subagents")).toBeInTheDocument();
-    expect(screen.getByRole("switch", { name: "Disable Subagents" })).toHaveAttribute(
+    expect(screen.getByRole("switch", { name: "Subagents always enabled" })).toHaveAttribute(
       "aria-checked",
       "true",
     );
+    expect(screen.getByRole("switch", { name: "Subagents always enabled" })).toBeDisabled();
+    expect(screen.getByText("required")).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: "Enable Web agent" })).toHaveAttribute(
       "aria-checked",
       "false",
     );
     expect(commandMocks.piListExtensionPackages).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps subagents on when legacy settings do not list the package", async () => {
+    commandMocks.piListExtensionPackages.mockResolvedValueOnce({ status: "ok", data: [] });
+    render(<PiExtensionsCard />);
+
+    const subagents = await screen.findByRole("switch", { name: "Subagents always enabled" });
+    expect(subagents).toHaveAttribute("aria-checked", "true");
+    expect(subagents).toBeDisabled();
+    fireEvent.click(subagents);
+    expect(commandMocks.piRemoveExtensionPackage).not.toHaveBeenCalled();
   });
 
   it("filters the curated catalog without losing the warning copy", async () => {
@@ -85,7 +98,7 @@ describe("PiExtensionsCard", () => {
     });
 
     expect(screen.getByText("Web agent")).toBeInTheDocument();
-    expect(screen.queryByRole("switch", { name: "Disable Subagents" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("switch", { name: "Subagents always enabled" })).not.toBeInTheDocument();
     expect(screen.getByText(/third-party pi packages can execute local code/i)).toBeInTheDocument();
   });
 
@@ -132,7 +145,7 @@ describe("PiExtensionsCard", () => {
     } as Response);
     render(<PiExtensionsCard />);
 
-    expect(await screen.findByText("From npm")).toBeInTheDocument();
+    expect(await screen.findByText("All packages")).toBeInTheDocument();
     expect(await screen.findByText("Reflag")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("switch", { name: "Enable Reflag" }));
@@ -142,6 +155,43 @@ describe("PiExtensionsCard", () => {
         "npm:@piotr-oles/pi-reflag",
       ),
     );
+  });
+
+  it("installs a recently published package directly from its compact card", async () => {
+    commandMocks.piInstallExtensionPackage.mockResolvedValueOnce({
+      status: "ok",
+      data: packageList("npm:pi-subagents", "npm:@example/pi-recent-tool"),
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        total: 1,
+        objects: [
+          {
+            package: {
+              name: "@example/pi-recent-tool",
+              description: "A newly published Pi package.",
+              date: new Date().toISOString(),
+              keywords: ["pi-package"],
+              links: {
+                npm: "https://www.npmjs.com/package/@example/pi-recent-tool",
+              },
+            },
+          },
+        ],
+      }),
+    } as Response);
+    render(<PiExtensionsCard />);
+
+    expect(await screen.findByText("Recently published")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Add Recent Tool" }));
+
+    await waitFor(() =>
+      expect(commandMocks.piInstallExtensionPackage).toHaveBeenCalledWith(
+        "npm:@example/pi-recent-tool",
+      ),
+    );
+    expect(await screen.findByRole("button", { name: "Remove Recent Tool" })).toBeInTheDocument();
   });
 
   it("locks other extension toggles while a package change is in flight", async () => {

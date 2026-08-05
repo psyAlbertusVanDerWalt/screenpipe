@@ -8,7 +8,7 @@ btw, we prefer that you don't contribute if you are not using or will use the pr
 
 before you begin:
 - try to run the [pre-built app](https://docs.screenpi.pe) to get familiar with the project
-- familiarize yourself with the project structure and architecture.
+- familiarize yourself with the repository structure and architecture.
 - new to contributing? the [beginner's onboarding guide](ONBOARDING.md) walks you from zero to a merged pr step by step (this file is the reference; that one is the walkthrough).
 
 ## installation and build guide
@@ -54,43 +54,119 @@ before you begin:
    bun tauri build --features metal
    ```
 
+#### sharing downloaded dependencies across worktrees
+
+The desktop prebuild keeps immutable native downloads such as FFmpeg, FFprobe,
+the Bun sidecars, MLX metallib, and Windows OpenBLAS in a machine-wide cache.
+The default is `~/.cache/screenpipe/native-deps`. To put it elsewhere, set the
+same absolute path in every worktree environment:
+
+```bash
+export SCREENPIPE_NATIVE_CACHE_DIR="$HOME/.cache/screenpipe/native-deps"
+export SCREENPIPE_FRONTEND_CACHE_DIR="$HOME/.cache/screenpipe/frontend-out"
+```
+
+Cache entries are versioned, validated, and protected by per-artifact locks, so
+concurrent worktree builds download each artifact at most once. Set either
+variable to `off` to disable that cache. Keep Cargo's `target` directory local
+to each worktree when running concurrent builds; do not set a shared
+`CARGO_TARGET_DIR`.
+
 ### windows
 
-1. **install winget (Prerequisite)**:
-   - Before proceeding with the other installations, make sure you have `winget` installed. You can download and install it by following this guide: [Install winget](https://winget.pro/winget-install-powershell/).
+These steps build the local NSIS installer (`*-setup.exe`). The default Tauri
+configuration intentionally produces `screenpipe - Development`, which can live
+next to the released app without taking over its identity or updater settings.
 
-2. **install required tools**:
+1. **install winget**:
+   - `winget` ships with App Installer on current Windows 10 and Windows 11. If
+     the command is missing, follow the [official Windows Package Manager
+     installation guide](https://learn.microsoft.com/windows/package-manager/winget/).
+
+2. **install the required tools**:
    ```powershell
-   winget install -e --id Microsoft.VisualStudio.2022.BuildTools
+   winget install -e --id Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
    winget install -e --id Rustlang.Rustup
    winget install -e --id LLVM.LLVM
    winget install -e --id Kitware.CMake
-   winget install -e --id GnuWin32.UnZip
    winget install -e --id Git.Git
-   winget install -e --id JernejSimoncic.Wget
    winget install -e --id 7zip.7zip
    irm https://bun.sh/install.ps1 | iex
    ```
 
-3. **set environment variables**:
+   The Visual Studio package alone is not enough: Tauri needs the **Desktop
+   development with C++** workload. The `--override` above installs that workload,
+   including MSVC and a Windows SDK. This is also the workload named in the
+   [official Tauri Windows prerequisites](https://v2.tauri.app/start/prerequisites/#windows).
+
+   Close and reopen PowerShell after the installers finish so the new commands
+   are on `PATH`.
+
+3. **configure and verify the toolchain**:
    ```powershell
-   [System.Environment]::SetEnvironmentVariable('LIBCLANG_PATH', 'C:\Program Files\LLVM\bin', 'User')
-   [System.Environment]::SetEnvironmentVariable('PATH', "$([System.Environment]::GetEnvironmentVariable('PATH', 'User'));C:\Program Files (x86)\GnuWin32\bin", 'User')
+   $llvmBin = 'C:\Program Files\LLVM\bin'
+   $env:LIBCLANG_PATH = $llvmBin
+   [System.Environment]::SetEnvironmentVariable('LIBCLANG_PATH', $llvmBin, 'User')
+
+   bun --version
+   cargo --version
+   cmake --version
+   if (-not (Test-Path "$env:LIBCLANG_PATH\libclang.dll")) { throw 'libclang.dll not found' }
+
+   $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+   if (-not (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)) {
+     throw 'install the Visual Studio Desktop development with C++ workload'
+   }
    ```
+
+   Setting the user environment variable only affects future terminals, so the
+   `$env:LIBCLANG_PATH` assignment is required for the current one.
 
 4. **clone the project**:
    ```powershell
-      git clone https://github.com/screenpipe/screenpipe.git
-      cd screenpipe
-   ```
-5. **build**:
-   ```powershell
+   git clone https://github.com/screenpipe/screenpipe.git
    cd screenpipe
-   cargo build --release
+   ```
+
+5. **build the Tauri installer**:
+   ```powershell
    cd apps/screenpipe-app-tauri
-   bun install
+   bun install --frozen-lockfile
    bun tauri build
    ```
+
+   Do not run the repository-root `cargo build --release` first unless you also
+   need the standalone CLI. The desktop app is a separate Cargo workspace with
+   its own `src-tauri/target` directory, so the root build does not warm this
+   build and makes a fresh setup substantially slower.
+
+6. **find the installer**:
+   ```powershell
+   Get-ChildItem .\src-tauri\target\release\bundle\nsis\*-setup.exe
+   ```
+
+#### what to expect from a fresh windows worktree
+
+- The first `bun tauri build` runs the frontend build and `scripts/pre_build.js`
+  automatically. The prebuild downloads and extracts FFmpeg and OpenBLAS, copies
+  the Bun sidecar and Visual C++ runtime DLLs, then Cargo compiles the native app.
+  You do not need to run the prebuild separately.
+- Plan for at least 10 GB of free disk space. In a clean x64 worktree the app-local
+  Cargo target alone can exceed 5 GB; `node_modules`, sidecars, and global Cargo
+  caches need additional space.
+- A fresh Git worktree shares Git objects, the global Cargo registry, and the
+  machine-wide native/frontend caches, but not `node_modules` or
+  `src-tauri/target`. The native files are restored from cache without another
+  download. Cargo compilation, relinking, and installer compression remain
+  worktree-local and can still take several minutes.
+- `failed to get npm global prefix` is a non-fatal Bun-discovery fallback when it
+  is immediately followed by `found bun` and `bun binary copied successfully`.
+- The local development installer is unsigned. Official Windows release builds
+  are Authenticode-signed in the release workflow, but a local build without the
+  release certificate is expected to report `NotSigned`.
+- `Microsoft VC143/144/145 CRT not found` means the Visual Studio C++ workload is
+  missing. A `libclang.dll` or bindgen error usually means `LIBCLANG_PATH` is not
+  set in the current terminal.
 
 ### linux
 
@@ -136,6 +212,59 @@ before you begin:
 [check out the docker setup here](https://github.com/sabrehagen/desktop-environment/blob/730a3134362927f8965589f6322b4554e0a5e388/docker/Dockerfile#L403)
 
 ## how can i contribute?
+
+### ai-assisted contributions
+
+ai assistance is welcome, but every outside contribution needs an accountable
+human driver. these rules apply to issues, pull requests, review comments, and
+replies to maintainers:
+
+- disclose the AI tool used, its autonomy level (`autocomplete`, `chat`, or
+  `agent`), and exactly what you personally verified. write `none` when no AI
+  tool was used.
+- do not use an autonomous agent to submit an outside issue, pull request, or
+  comment. the accountable contributor must personally make the submission.
+- write the problem statement, rationale, and replies to maintainers in your
+  own words. AI may help construct tests and reproductions, but it must not
+  impersonate you.
+- understand and be able to explain every material change. do not ask a model
+  to answer maintainers on your behalf.
+- never claim manual testing you did not perform. include the exact commands
+  and results, plus real end-to-end evidence where applicable.
+- provide evidence appropriate to the change:
+  - UI or behavior changes: a before/after recording.
+  - backend changes: regression tests and relevant logs or results.
+  - performance changes: reproducible before/after benchmarks.
+  - docs, CI, and pure refactors: the relevant checks and an explanation; do
+    not fabricate a video.
+- do not submit unsolicited LLM-generated reviews of another contributor's
+  pull request.
+
+use `autocomplete` when AI only supplied inline completions, `chat` when you
+asked for suggestions or code and chose what to apply, and `agent` when AI
+planned or executed multi-step work or edited files.
+
+maintainers use process labels to identify the concrete next step:
+
+- `needs-reproduction`: provide a reproducible case and exact steps.
+- `needs-tests`: add the missing regression or coverage tests.
+- `needs-evidence`: provide the required recording, logs, results, or benchmark.
+- `needs-human-explanation`: explain the rationale or material changes yourself.
+- `needs-scope-approval`: get maintainer agreement before continuing the work.
+
+you are welcome to reopen the contribution, or submit a corrected replacement
+that links the original, after addressing that request.
+
+reopening or resubmitting without addressing the stated request results in a
+seven-calendar-day contribution cooldown, beginning when a maintainer posts the
+cooldown notice. during the cooldown, you may not open or reopen issues or pull
+requests, or submit review comments in this repository. the next submission
+after that cooldown that again reopens or resubmits without addressing a
+concrete remediation request results in a repository contribution
+ban.
+
+enforcement is based on accountable ownership, accepted scope, evidence, and
+the contributor's ability to explain the work.
 
 ### reporting bugs
 
@@ -209,6 +338,21 @@ cargo test
 ```
 
 ## other hacks
+
+### fast desktop UI loop without rebuilding rust
+
+for React/layout work, run the desktop frontend directly in a browser:
+
+```bash
+cd apps/screenpipe-app-tauri
+bun run dev:web
+```
+
+open <http://127.0.0.1:1420/home>. this uses in-memory Tauri and local-engine
+mocks. use `bun run dev:web:live` to keep the mocked Tauri shell but talk to an
+already-running local engine, or `bun run dev:tauri` for the full native app.
+the supported fixtures, API-key setup, and native-validation boundary are in
+[`apps/screenpipe-app-tauri/README.md`](apps/screenpipe-app-tauri/README.md#fast-browser-ui-development).
 
 ### running dev + prod in the same time
 

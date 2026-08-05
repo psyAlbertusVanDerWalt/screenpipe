@@ -12,35 +12,35 @@ results and `cargo llvm-cov` data on top when judging release confidence.
 ## Dashboards
 
 - E2E dashboard: [apps/screenpipe-app-tauri/e2e/COVERAGE.md](apps/screenpipe-app-tauri/e2e/COVERAGE.md)
-- Core engine dashboard: [coverage/CORE.md](coverage/CORE.md)
+- Core engine dashboard: [docs/coverage/CORE.md](docs/coverage/CORE.md)
 
 ## Current Snapshot
 
 ### Tauri E2E
 
-- Mapped specs: 40
-- Declared test blocks: 142
-- Weighted coverage points: 113.2
+- Mapped specs: 93
+- Declared test blocks: 259
+- Weighted coverage points: 199.9
 
 | Platform | Specs | Declared tests | Weighted points | Layers | Features | Critical score |
 | --- | --- | --- | --- | --- | --- | --- |
-| windows | 33 | 131 | 109.8 | 14 | 39 | 92% |
-| macos | 37 | 112 | 87.4 | 14 | 40 | 89% |
-| linux | 28 | 100 | 83.9 | 12 | 36 | 86% |
+| windows | 74 | 228 | 185.2 | 15 | 77 | 91% |
+| macos | 89 | 222 | 170.7 | 17 | 79 | 89% |
+| linux | 64 | 188 | 155.0 | 14 | 72 | 88% |
 
 ### Core Engine
 
-- Mapped suites: 24
-- Mapped Rust files: 191
-- Active test blocks: 1641
-- Ignored/manual test blocks: 108
-- Weighted coverage points: 1366.8
+- Mapped suites: 32
+- Mapped Rust files: 310
+- Active test blocks: 2905
+- Ignored/manual test blocks: 133
+- Weighted coverage points: 2388.8
 
 | Platform | Suites | Active tests | Ignored tests | Weighted points | Layers | Flows | Critical score |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| windows | 21 | 1544 | 105 | 1321.0 | 21 | 11 | 100% |
-| macos | 21 | 1596 | 85 | 1339.1 | 22 | 11 | 100% |
-| linux | 19 | 1533 | 82 | 1310.4 | 20 | 11 | 100% |
+| windows | 29 | 2777 | 128 | 2330.0 | 21 | 11 | 100% |
+| macos | 29 | 2828 | 108 | 2339.9 | 22 | 11 | 100% |
+| linux | 25 | 2471 | 102 | 2052.4 | 20 | 11 | 100% |
 
 ## Refresh
 

@@ -29,11 +29,11 @@ vi.mock("@/lib/hooks/use-settings", () => ({
   }),
 }));
 
-vi.mock("@/lib/hooks/use-is-enterprise-build", () => ({
-  useEnterpriseBuildStatus: () => ({
-    isEnterprise: mocks.isEnterprise,
-    resolved: mocks.enterpriseResolved,
-    error: mocks.enterpriseError,
+vi.mock("@/lib/hooks/use-managed-policy", () => ({
+  useManagedPolicy: () => ({
+    isManagedDeployment: mocks.isEnterprise,
+    isManagedDeploymentResolved: mocks.enterpriseResolved,
+    managedDeploymentResolutionError: mocks.enterpriseError,
   }),
 }));
 
@@ -202,7 +202,9 @@ describe("RemoteSupportLogsCard", () => {
       screen.getByText(/Your organization can request diagnostic logs/i),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/automatically when managed data uploads keep failing/i),
+      screen.getByText(
+        /Nothing is uploaded unless an administrator sends a request/i,
+      ),
     ).toBeInTheDocument();
   });
 

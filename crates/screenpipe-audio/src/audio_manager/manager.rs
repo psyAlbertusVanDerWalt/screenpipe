@@ -16,7 +16,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    sync::{broadcast, oneshot, Mutex, RwLock},
+    sync::{broadcast, oneshot, Mutex, Notify, RwLock},
     task::JoinHandle,
 };
 use tracing::{debug, error, info, warn};
@@ -121,6 +121,29 @@ struct MeetingEventData {
 
 type RecordingHandlesMap = DashMap<AudioDevice, Arc<Mutex<JoinHandle<Result<()>>>>>;
 const MEETING_AUDIO_FRAME_BUFFER: usize = 512;
+const RECONCILIATION_IDLE_INTERVAL: Duration = Duration::from_secs(120);
+const MAX_IMMEDIATE_RECONCILIATION_SWEEPS: usize = 4;
+
+fn meetings_only_capture_waiting(
+    capture_mode: &AudioCaptureMode,
+    meeting_state: Option<bool>,
+) -> bool {
+    matches!(capture_mode, AudioCaptureMode::MeetingsOnly) && meeting_state != Some(true)
+}
+
+/// Final privacy boundary before an audio chunk can reach disk or
+/// transcription. Meetings-only capture fails closed when its detector is
+/// absent. A registered session stream may flush while a confirmed meeting is
+/// being torn down because its owner already scopes that short tail.
+fn should_persist_audio_chunk(
+    capture_mode: &AudioCaptureMode,
+    meeting_state: Option<bool>,
+    is_session_stream: bool,
+) -> bool {
+    !matches!(capture_mode, AudioCaptureMode::MeetingsOnly)
+        || meeting_state == Some(true)
+        || (meeting_state == Some(false) && is_session_stream)
+}
 
 /// Wall-clock milliseconds since the Unix epoch (0 if the clock predates it).
 /// Local to the audio manager so the receiver-loop stamping and the piggyback
@@ -164,6 +187,9 @@ pub struct AudioManager {
     engine_builds: EngineBuildCoordinator,
     /// Handle to the reconciliation background task so we can abort it on shutdown.
     reconciliation_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
+    /// Wakes the background reconciliation task when a foreground sweep fills
+    /// its 50-chunk cap, so a meeting backlog keeps draining immediately.
+    reconciliation_wakeup: Arc<Notify>,
     /// Output devices temporarily stopped due to DRM content detection.
     /// Stored so they can be restarted when DRM clears.
     drm_stopped_devices: Arc<RwLock<Vec<AudioDevice>>>,
@@ -375,6 +401,7 @@ impl AudioManager {
             engine: Arc::new(RwLock::new(None)),
             engine_builds: EngineBuildCoordinator::new(),
             reconciliation_handle: Arc::new(RwLock::new(None)),
+            reconciliation_wakeup: Arc::new(Notify::new()),
             drm_stopped_devices: Arc::new(RwLock::new(Vec::new())),
             user_disabled_devices: Arc::new(RwLock::new(HashSet::new())),
             session_devices: Arc::new(std::sync::RwLock::new(HashSet::new())),
@@ -500,9 +527,15 @@ impl AudioManager {
             let output_path_bg = self.options.read().await.output_path.clone();
             let metrics_bg = self.metrics.clone();
             let meeting_detector_bg = self.meeting_detector().await;
+            let reconciliation_wakeup = self.reconciliation_wakeup.clone();
             let handle = tokio::spawn(async move {
-                // Wait for model to load + initial recordings
-                tokio::time::sleep(Duration::from_secs(120)).await;
+                // Wait for model load + initial recordings, unless a foreground
+                // session-end sweep tells us its 50-chunk cap left more work.
+                tokio::select! {
+                    _ = tokio::time::sleep(RECONCILIATION_IDLE_INTERVAL) => {}
+                    _ = reconciliation_wakeup.notified() => {}
+                }
+                let mut consecutive_full_sweeps = 0usize;
                 loop {
                     // Contain a panic inside a sweep so it cannot kill this
                     // long-lived worker (issue #3498: a single panic used to
@@ -519,7 +552,7 @@ impl AudioManager {
                                 debug!(
                                     "reconciliation: skipping background sweep during active audio session"
                                 );
-                                return;
+                                return false;
                             }
                         }
 
@@ -530,7 +563,7 @@ impl AudioManager {
                             let batch_max_dur = opts.batch_max_duration_secs;
                             drop(opts);
 
-                            let count = super::reconciliation::reconcile_untranscribed(
+                            let sweep = super::reconciliation::reconcile_untranscribed(
                                 &db,
                                 transcription_engine,
                                 on_insert_bg.as_ref(),
@@ -541,25 +574,48 @@ impl AudioManager {
                                 Some(metrics_bg.clone()),
                             )
                             .await;
+                            let count = sweep.processed_chunks;
                             if count > 0 {
                                 info!("reconciliation: transcribed {} orphaned chunks", count);
                             }
+                            return sweep.hit_candidate_limit;
                         }
+                        false
                     })
                     .catch_unwind()
                     .await;
-                    if let Err(panic) = swept {
-                        let reason = panic
-                            .downcast_ref::<&str>()
-                            .copied()
-                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                            .unwrap_or("unknown cause");
-                        error!(
-                            "reconciliation: sweep panicked, worker continues: {}",
-                            reason
+                    let swept_full_batch = match swept {
+                        Ok(full) => full,
+                        Err(panic) => {
+                            let reason = panic
+                                .downcast_ref::<&str>()
+                                .copied()
+                                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                                .unwrap_or("unknown cause");
+                            error!(
+                                "reconciliation: sweep panicked, worker continues: {}",
+                                reason
+                            );
+                            false
+                        }
+                    };
+
+                    if swept_full_batch
+                        && consecutive_full_sweeps + 1 < MAX_IMMEDIATE_RECONCILIATION_SWEEPS
+                    {
+                        consecutive_full_sweeps += 1;
+                        info!(
+                            "reconciliation: sweep hit the chunk cap; continuing backlog drain immediately"
                         );
+                        tokio::task::yield_now().await;
+                        continue;
                     }
-                    tokio::time::sleep(Duration::from_secs(120)).await;
+
+                    consecutive_full_sweeps = 0;
+                    tokio::select! {
+                        _ = tokio::time::sleep(RECONCILIATION_IDLE_INTERVAL) => {}
+                        _ = reconciliation_wakeup.notified() => {}
+                    }
                 }
             });
             *self.reconciliation_handle.write().await = Some(handle);
@@ -730,12 +786,15 @@ impl AudioManager {
         // Remove from disabled FIRST so start_device gate allows it
         self.user_disabled_devices.write().await.remove(device_name);
 
+        // If the audio manager was fully stopped (e.g. global capture pause),
+        // restart the pipeline so this device can actually produce data.
+        // start() is idempotent — no-op if already Running.
         if self.status().await != AudioManagerStatus::Running {
             info!(
-                "user re-enabled audio device while audio manager is stopped: {}",
+                "audio manager stopped, restarting pipeline to resume device: {}",
                 device_name
             );
-            return Ok(());
+            self.start().await?;
         }
 
         let device = match parse_audio_device(device_name) {
@@ -771,6 +830,15 @@ impl AudioManager {
         if self.options.read().await.is_disabled {
             debug!(
                 "skipping start of audio device because audio capture is disabled: {}",
+                device
+            );
+            return Ok(());
+        }
+
+        #[cfg(target_os = "macos")]
+        if screenpipe_config::should_pause_audio_for_lock() {
+            debug!(
+                "skipping start of audio device while screen is locked: {}",
                 device
             );
             return Ok(());
@@ -814,6 +882,33 @@ impl AudioManager {
             return Ok(());
         }
 
+        // Meetings-only is a device-ownership contract, not merely a
+        // persistence filter. The OS meeting watcher does not depend on these
+        // streams on macOS/Windows, so release normal configured devices while
+        // idle and let the monitor reopen them at the next meeting edge.
+        // A missing detector fails closed: without a confirmed meeting this
+        // mode must never acquire an audio device.
+        if self.meetings_only_capture_waiting().await {
+            debug!(
+                "skipping start of audio device while meetings-only capture waits for a meeting: {}",
+                device
+            );
+            return Ok(());
+        }
+
+        // Bluetooth mics always force the paired device's audio link out of
+        // A2DP into SCO, degrading the user's headphone/speaker output — a
+        // macOS/OS-level tradeoff with no external workaround (issue #3750).
+        // Gated to detected meetings by default; `always_record_bluetooth_mic`
+        // opts back into always-on capture.
+        if self.bluetooth_input_gate_blocks(device).await {
+            debug!(
+                "skipping start of bluetooth mic {}: not in a meeting (always_record_bluetooth_mic is off)",
+                device
+            );
+            return Ok(());
+        }
+
         if let Err(e) = self.device_manager.start_device(device).await {
             let err_str = e.to_string();
 
@@ -822,6 +917,31 @@ impl AudioManager {
             } else if !err_str.contains("already running") {
                 return Err(e);
             }
+        }
+
+        // The meeting may end while the OS backend is opening the stream. The
+        // pre-start gate cannot close that race, and the monitor cannot see the
+        // stream until its recording handle is registered.
+        if self.meetings_only_capture_waiting().await {
+            self.stop_device_recording(device).await?;
+            debug!(
+                "stopped newly-opened audio device after meeting ended during startup: {}",
+                device
+            );
+            return Ok(());
+        }
+
+        // The lock flag can change while CoreAudio is opening the stream. The
+        // pre-start guard above cannot close that race, and the device monitor
+        // cannot see this stream until its recording handle is registered.
+        #[cfg(target_os = "macos")]
+        if screenpipe_config::should_pause_audio_for_lock() {
+            self.stop_device_recording(device).await?;
+            debug!(
+                "stopped newly-opened audio device after screen locked during startup: {}",
+                device
+            );
+            return Ok(());
         }
 
         if !self.recording_handles.contains_key(device) {
@@ -856,6 +976,21 @@ impl AudioManager {
         if self.options.read().await.is_disabled {
             return Ok(());
         }
+        if self.meetings_only_capture_waiting().await {
+            debug!(
+                "skipping start of meeting-session audio device without a confirmed meeting: {}",
+                device
+            );
+            return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        if screenpipe_config::should_pause_audio_for_lock() {
+            debug!(
+                "skipping start of meeting-session audio device while screen is locked: {}",
+                device
+            );
+            return Ok(());
+        }
         // Insert BEFORE starting: the audio-receiver drop-gate bypass must see
         // this device from the very first chunk. Rolled back on failure below.
         self.session_devices
@@ -880,6 +1015,39 @@ impl AudioManager {
                 return Err(e);
             }
         }
+
+        // The meeting can end while the backend is opening the stream. Remove
+        // session ownership before stopping so a racing callback cannot bypass
+        // the persistence gate after the edge.
+        if self.meetings_only_capture_waiting().await {
+            self.session_devices
+                .write()
+                .unwrap()
+                .remove(&device.to_string());
+            self.stop_device_recording(device).await?;
+            debug!(
+                "stopped newly-opened meeting-session audio device after the meeting ended during startup: {}",
+                device
+            );
+            return Ok(());
+        }
+
+        // As above, close a stream that finished opening after the screen-lock
+        // gate was checked. Remove session bookkeeping before the generic stop.
+        #[cfg(target_os = "macos")]
+        if screenpipe_config::should_pause_audio_for_lock() {
+            self.session_devices
+                .write()
+                .unwrap()
+                .remove(&device.to_string());
+            self.stop_device_recording(device).await?;
+            debug!(
+                "stopped newly-opened meeting-session audio device after screen locked during startup: {}",
+                device
+            );
+            return Ok(());
+        }
+
         if !self.recording_handles.contains_key(device) {
             if let Some(is_running) = self.device_manager.is_running_mut(device) {
                 is_running.store(true, Ordering::Relaxed);
@@ -1090,6 +1258,7 @@ impl AudioManager {
         let meeting_audio_tap = self.meeting_audio_tap.clone();
         let db = self.db.clone();
         let on_insert_session = self.on_transcription_insert.clone();
+        let reconciliation_wakeup = self.reconciliation_wakeup.clone();
         // Session streams (Meeting Tap, piggyback mic) bypass the meetings-only
         // drop gate below — they exist only during a meeting by construction.
         let session_devices = self.session_devices.clone();
@@ -1166,12 +1335,10 @@ impl AudioManager {
                     meeting.on_audio_activity(&audio.device.device_type, has_activity);
                 }
 
-                // Meetings-only capture: drop this chunk before it is persisted or
-                // transcribed unless a meeting / audio session is active. The detector
-                // was just fed this chunk's activity above, so a meeting that is
-                // starting still flips the session on in time. With no detector we
-                // cannot tell whether we're in a meeting, so we keep capturing rather
-                // than silently dropping everything.
+                // Meetings-only capture: enforce the privacy boundary again at
+                // the persistence edge. Device ownership should already be closed
+                // while idle, but an in-flight callback can race a meeting end.
+                // Detector absence fails closed instead of persisting ambient audio.
                 if audio_capture_mode == AudioCaptureMode::MeetingsOnly {
                     // Session streams exist only during a meeting by
                     // construction — never drop them, even if the detector
@@ -1180,13 +1347,14 @@ impl AudioManager {
                         .read()
                         .unwrap()
                         .contains(&audio.device.to_string());
-                    let in_session = meeting_detector
-                        .as_ref()
-                        .map(|m| m.is_in_audio_session())
-                        .unwrap_or(true);
-                    if !is_session_stream && !in_session {
+                    let meeting_state = meeting_detector.as_ref().map(|m| m.is_in_audio_session());
+                    if !should_persist_audio_chunk(
+                        &audio_capture_mode,
+                        meeting_state,
+                        is_session_stream,
+                    ) {
                         debug!(
-                            "meetings-only capture: no active meeting, dropping audio chunk from {:?}",
+                            "meetings-only capture: no confirmed meeting, dropping audio chunk from {:?}",
                             audio.device.name
                         );
                         continue;
@@ -1343,7 +1511,7 @@ impl AudioManager {
                                 "batch mode: audio session ended, transcribing accumulated audio"
                             );
                             let data_dir = output_path.as_deref();
-                            let count = super::reconciliation::reconcile_untranscribed(
+                            let sweep = super::reconciliation::reconcile_untranscribed(
                                 &db,
                                 &engine,
                                 on_insert_session.as_ref(),
@@ -1354,8 +1522,12 @@ impl AudioManager {
                                 Some(metrics.clone()),
                             )
                             .await;
+                            let count = sweep.processed_chunks;
                             for _ in 0..count {
                                 metrics.record_segment_batch_processed();
+                            }
+                            if sweep.hit_candidate_limit {
+                                reconciliation_wakeup.notify_one();
                             }
                             info!("batch mode: transcribed {} chunks", count);
                         } else if now_in_session {
@@ -1503,8 +1675,17 @@ impl AudioManager {
     /// that only hold an `AudioManager` (the piggyback sweep) can distinguish a
     /// registered-but-dead stream from one actually delivering audio — without
     /// reaching into the private `device_manager` or duplicating the check.
-    pub(crate) fn is_device_actively_streaming(&self, device: &AudioDevice) -> bool {
+    pub fn is_device_actively_streaming(&self, device: &AudioDevice) -> bool {
         super::is_device_actively_streaming(&self.device_manager, device)
+    }
+
+    /// Non-blocking read of the configured capture mode. Returns `None` if the
+    /// options lock is momentarily contended so `/health` never blocks on it.
+    pub fn configured_audio_capture_mode(&self) -> Option<AudioCaptureMode> {
+        self.options
+            .try_read()
+            .ok()
+            .map(|o| o.audio_capture_mode.clone())
     }
 
     /// Non-blocking read of the *configured* transcription mode. Returns `None`
@@ -1610,6 +1791,24 @@ impl AudioManager {
         self.meeting_detector.read().await.clone()
     }
 
+    /// Whether normal configured streams must stay closed until a meeting is
+    /// detected. Session streams intentionally bypass this gate because their
+    /// lifetime is already scoped to a meeting.
+    pub async fn meetings_only_capture_waiting(&self) -> bool {
+        // macOS and Windows use OS process ownership signals for meeting
+        // detection. Linux still relies on captured audio onset to accelerate
+        // its UI scanner, so retain its documented detector stream for now.
+        if !cfg!(any(target_os = "macos", target_os = "windows")) {
+            return false;
+        }
+        let capture_mode = self.options.read().await.audio_capture_mode.clone();
+        let meeting_state = self
+            .meeting_detector()
+            .await
+            .map(|detector| detector.is_in_meeting());
+        meetings_only_capture_waiting(&capture_mode, meeting_state)
+    }
+
     /// Whether the meeting piggyback ("smart recording") flag is on. Consumed
     /// by the device monitor's piggyback sweep (`meeting_piggyback.rs`) — the
     /// `options` field is private to this module, so the sweep can't read it
@@ -1618,6 +1817,57 @@ impl AudioManager {
     /// piggyback in continuous ("always") capture just as in meetings-only.
     pub(crate) async fn piggyback_enabled(&self) -> bool {
         self.options.read().await.experimental_meeting_piggyback
+    }
+
+    /// Whether Bluetooth mics are exempt from the meeting gate (see
+    /// `start_device`'s Bluetooth check and the device monitor's
+    /// `run_bluetooth_mic_gate_sweep`). Consumed outside this module, so
+    /// `pub(crate)` rather than private, matching `piggyback_enabled`.
+    pub(crate) async fn always_record_bluetooth_mic(&self) -> bool {
+        self.options.read().await.always_record_bluetooth_mic
+    }
+
+    /// Whether `device` is currently withheld by the Bluetooth meeting gate.
+    /// `start_device` uses this internally, but it's also `pub(crate)` for
+    /// callers in `device_monitor.rs` that swap the active input device
+    /// based on system-default changes or "no input running" recovery —
+    /// they MUST check this BEFORE stopping a working device or resetting a
+    /// retry backoff on the strength of `start_device` returning `Ok(())`.
+    /// That `Ok(())` only means "no error", not "now actually capturing" —
+    /// this gate is a deliberate, often long-lived no-op, not a failure, so
+    /// treating it as success causes real capture loss (stopping a working
+    /// mic in favor of one that silently never started) or a tight retry
+    /// loop (backoff keeps getting reset by a "success" that never streams
+    /// a single frame, hammering the Bluetooth device's CoreAudio object
+    /// every couple of seconds — this is what caused the AirPods to flicker
+    /// between showing up as an input and an output, since sitting on the
+    /// mic-open path this often perturbs the A2DP/SCO profile negotiation).
+    pub(crate) async fn bluetooth_input_gate_blocks(
+        &self,
+        device: &crate::core::device::AudioDevice,
+    ) -> bool {
+        if device.device_type != crate::core::device::DeviceType::Input {
+            return false;
+        }
+        let kind = crate::core::device_detection::InputDeviceKind::detect(&device.name);
+        if kind != crate::core::device_detection::InputDeviceKind::Bluetooth {
+            return false;
+        }
+        // Only probe hardware for confirmed-Bluetooth devices — a dedicated
+        // mic-only Bluetooth device (no output side on the same hardware)
+        // has nothing to protect, so it's exempt from the gate entirely.
+        let is_combo_headset = crate::core::device::bluetooth_input_is_combo_headset(&device.name);
+        let always_override = self.always_record_bluetooth_mic().await;
+        let in_meeting = match self.meeting_detector().await {
+            Some(d) => d.is_in_meeting(),
+            None => false,
+        };
+        !crate::core::device_detection::bluetooth_mic_allowed(
+            &kind,
+            is_combo_headset,
+            always_override,
+            in_meeting,
+        )
     }
 
     /// Returns the shared WhisperContext for backward compatibility, if loaded.
@@ -2095,6 +2345,57 @@ mod tests {
     };
     use tokio::sync::{Barrier, Notify, Semaphore};
 
+    #[test]
+    fn meetings_only_waits_until_a_meeting_is_confirmed() {
+        assert!(meetings_only_capture_waiting(
+            &AudioCaptureMode::MeetingsOnly,
+            Some(false)
+        ));
+        assert!(!meetings_only_capture_waiting(
+            &AudioCaptureMode::MeetingsOnly,
+            Some(true)
+        ));
+        assert!(meetings_only_capture_waiting(
+            &AudioCaptureMode::MeetingsOnly,
+            None
+        ));
+        assert!(!meetings_only_capture_waiting(
+            &AudioCaptureMode::Always,
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn meetings_only_persistence_gate_fails_closed() {
+        for meeting_state in [None, Some(false)] {
+            assert!(!should_persist_audio_chunk(
+                &AudioCaptureMode::MeetingsOnly,
+                meeting_state,
+                false,
+            ));
+        }
+        assert!(should_persist_audio_chunk(
+            &AudioCaptureMode::MeetingsOnly,
+            Some(true),
+            false,
+        ));
+        assert!(should_persist_audio_chunk(
+            &AudioCaptureMode::MeetingsOnly,
+            Some(false),
+            true,
+        ));
+        assert!(!should_persist_audio_chunk(
+            &AudioCaptureMode::MeetingsOnly,
+            None,
+            true,
+        ));
+        assert!(should_persist_audio_chunk(
+            &AudioCaptureMode::Always,
+            None,
+            false,
+        ));
+    }
+
     #[derive(Clone)]
     struct FakeEngine {
         config: &'static str,
@@ -2365,17 +2666,23 @@ mod tests {
     /// ignored because it requires the multi-gigabyte model to already be in
     /// the Hugging Face cache and the Xcode Metal toolchain to be installed.
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "parakeet-mlx"))]
+    fn cached_parakeet_mlx_model_available() -> bool {
+        const MODEL_REPO: &str = "mlx-community/parakeet-tdt-0.6b-v3";
+
+        let cache = hf_hub::Cache::default().repo(hf_hub::Repo::model(MODEL_REPO.to_string()));
+        cache.get("model.safetensors").is_some()
+            && cache.get("config.json").is_some()
+            && (cache.get("vocab.txt").is_some() || cache.get("tokenizer.model").is_some())
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "parakeet-mlx"))]
     #[tokio::test]
     #[ignore = "requires cached Parakeet MLX weights and the Xcode Metal toolchain"]
     async fn cached_parakeet_refresh_reuses_single_mlx_model() {
         const MODEL_REPO: &str = "mlx-community/parakeet-tdt-0.6b-v3";
         const MAX_REUSE_DELTA_BYTES: usize = 64 * 1024 * 1024;
 
-        let cache = hf_hub::Cache::from_env().repo(hf_hub::Repo::model(MODEL_REPO.to_string()));
-        let model_cached = cache.get("model.safetensors").is_some()
-            && cache.get("config.json").is_some()
-            && (cache.get("vocab.txt").is_some() || cache.get("tokenizer.model").is_some());
-        if !model_cached {
+        if !cached_parakeet_mlx_model_available() {
             eprintln!(
                 "skipping cached Parakeet MLX smoke: {MODEL_REPO} is not complete in the HF cache"
             );

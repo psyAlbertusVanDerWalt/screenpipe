@@ -297,14 +297,14 @@ impl DatabaseManager {
             let del_transcriptions = format!(
                 "DELETE FROM audio_transcriptions WHERE audio_chunk_id IN ({placeholders})"
             );
-            let mut q = sqlx::query(&del_transcriptions);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(del_transcriptions));
             for &id in group {
                 q = q.bind(id);
             }
             q.execute(&mut **tx.conn()).await?;
 
             let del_chunks = format!("DELETE FROM audio_chunks WHERE id IN ({placeholders})");
-            let mut q = sqlx::query(&del_chunks);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(del_chunks));
             for &id in group {
                 q = q.bind(id);
             }
@@ -709,6 +709,7 @@ impl DatabaseManager {
                     ChunkOutcome::Duplicate => "transcribed",
                     _ => unreachable!(),
                 };
+                let mut tx = self.begin_immediate_with_retry().await?;
                 sqlx::query(
                     "UPDATE audio_chunks \
                      SET transcription_status = ?1, \
@@ -720,8 +721,9 @@ impl DatabaseManager {
                 .bind(status)
                 .bind(now)
                 .bind(audio_chunk_id)
-                .execute(&self.pool)
+                .execute(&mut **tx.conn())
                 .await?;
+                tx.commit().await?;
                 Ok(())
             }
 
@@ -729,6 +731,7 @@ impl DatabaseManager {
                 // Transient failure: bump attempts. If we'd hit the cap, flip
                 // to `failed` so the sweep stops re-trying. We do this in one
                 // UPDATE statement so a concurrent attempt can't double-flip.
+                let mut tx = self.begin_immediate_with_retry().await?;
                 sqlx::query(
                     "UPDATE audio_chunks \
                      SET transcription_attempts = transcription_attempts + 1, \
@@ -744,12 +747,14 @@ impl DatabaseManager {
                 .bind(&reason)
                 .bind(MAX_TRANSCRIPTION_ATTEMPTS)
                 .bind(audio_chunk_id)
-                .execute(&self.pool)
+                .execute(&mut **tx.conn())
                 .await?;
+                tx.commit().await?;
                 Ok(())
             }
 
             ChunkOutcome::FailedPermanent { reason } => {
+                let mut tx = self.begin_immediate_with_retry().await?;
                 sqlx::query(
                     "UPDATE audio_chunks \
                      SET transcription_status = 'failed', \
@@ -761,8 +766,9 @@ impl DatabaseManager {
                 .bind(now)
                 .bind(&reason)
                 .bind(audio_chunk_id)
-                .execute(&self.pool)
+                .execute(&mut **tx.conn())
                 .await?;
+                tx.commit().await?;
                 Ok(())
             }
         }
@@ -777,6 +783,7 @@ impl DatabaseManager {
         &self,
         audio_chunk_id: i64,
     ) -> Result<(), sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
         sqlx::query(
             "UPDATE audio_chunks \
              SET transcription_status = 'pending', \
@@ -786,8 +793,9 @@ impl DatabaseManager {
              WHERE id = ?1",
         )
         .bind(audio_chunk_id)
-        .execute(&self.pool)
+        .execute(&mut **tx.conn())
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -941,7 +949,7 @@ impl DatabaseManager {
                ORDER BY ac.timestamp ASC"#,
             placeholders.join(", ")
         );
-        let mut query = sqlx::query_as::<_, AudioChunkInfo>(&sql);
+        let mut query = sqlx::query_as::<_, AudioChunkInfo>(sqlx::AssertSqlSafe(sql));
         for id in ids {
             query = query.bind(id);
         }

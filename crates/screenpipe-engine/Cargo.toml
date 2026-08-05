@@ -21,12 +21,15 @@ screenpipe-audio = { path = "../screenpipe-audio" }
 screenpipe-core = { path = "../screenpipe-core", features = ["security", "cloud-sync", "secrets"] }
 screenpipe-db = { path = "../screenpipe-db" }
 screenpipe-redact = { path = "../screenpipe-redact", features = ["opf-text"] }
+screenpipe-resource = { path = "../screenpipe-resource" }
 screenpipe-a11y = { path = "../screenpipe-a11y", features = ["db"] }
 screenpipe-capture = { path = "../screenpipe-capture" }
 screenpipe-config = { path = "../screenpipe-config" }
 screenpipe-connect = { path = "../screenpipe-connect" }
 screenpipe-vault = { path = "../screenpipe-vault" }
 screenpipe-secrets = { path = "../screenpipe-secrets" }
+screenpipe-semantic = { path = "../screenpipe-semantic" }
+screenpipe-sqlite-recovery = { path = "../screenpipe-sqlite-recovery" }
 
 
 # Image processing
@@ -40,6 +43,7 @@ sqlx = { workspace = true, features = [
     "chrono",
     "migrate",
 ] }
+rusqlite = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -70,6 +74,7 @@ colored = "2.0"
 
 # Plugins
 futures = { workspace = true, features = ["std"] }
+tokio-stream = { workspace = true, features = ["sync"] }
 
 # Directory management
 dirs = { workspace = true }
@@ -136,6 +141,7 @@ env_logger = { workspace = true }
 tempfile = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tower = { version = "0.4", features = ["util"] }
+tiktoken-rs = "0.11.0"
 
 # Lock-free queue used by tests/consumer_sleep_test.rs to reproduce the
 # OCR frame-drop bug (see the test's docstring). Not needed by the crate

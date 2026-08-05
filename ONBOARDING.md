@@ -226,3 +226,11 @@ Now go find a small issue and do it properly.
 ---
 
 > This started as one contributor's path from zero to a merged PR, written down so the next person doesn't bleed for the same lessons. If a step is wrong, stale, or could be kinder, change it. The best version of this guide is the one the next newcomer improves for the one after.
+
+
+### Other tips
+
+- AI assistance is welcome, but you own the contribution. follow the [AI-assisted contribution policy](CONTRIBUTING.md#ai-assisted-contributions), test the work personally, and report only evidence you actually produced
+- Be creative: go beyond what other product do, take inspiration on great artists, painters, surprise use with amazing UIs
+- Can a 80 years old grand pa use the feature you shipped? If not, try harder
+- Measure performance, create evals, chaos engineer your code and cover all edge cases

@@ -6,15 +6,30 @@
 mod timeline_performance_tests {
     use chrono::{Duration, Utc};
     use screenpipe_db::{AudioDevice, DatabaseManager, DeviceType, OcrEngine};
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
     use std::time::Instant;
+
+    static NEXT_DB_ID: AtomicU64 = AtomicU64::new(0);
 
     async fn setup_test_db() -> DatabaseManager {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
             .try_init();
 
-        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+        // Each benchmark needs its own coordinator key. Plain `sqlite::memory:`
+        // creates independent SQLx databases, but the process-wide SQLite write
+        // coordinator sees the same raw path and serializes every benchmark's
+        // write queue behind one semaphore. On slower CI runners, competing
+        // 2k-5k-frame inserts can exhaust the 30-second acquisition budget.
+        let db_name = format!(
+            "file:timeline-perf-{}-{}?mode=memory&cache=shared",
+            std::process::id(),
+            NEXT_DB_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let db = DatabaseManager::new(&db_name, Default::default())
             .await
             .unwrap();
 
@@ -403,24 +418,18 @@ mod timeline_performance_tests {
         // Remove if exists
         let _ = std::fs::remove_file(path);
 
-        let db_url = format!("sqlite:{}", path);
-
-        let db = DatabaseManager::new(&db_url, Default::default())
+        let db = DatabaseManager::new(path, Default::default())
             .await
             .unwrap();
-
-        sqlx::migrate!("./src/migrations")
-            .run(&db.pool)
-            .await
-            .expect("Failed to run migrations");
-
         db
     }
 
     /// Test with file-based SQLite - closer to real customer experience
     #[tokio::test]
     async fn test_file_based_db_performance() {
-        let db_path = "/tmp/screenpipe_test_perf.db";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("screenpipe_test_perf.db");
+        let db_path = db_path.to_str().unwrap();
         let db = setup_file_db(db_path).await;
         let frame_count = 3000; // ~1 hour at 0.5 FPS
 
@@ -436,10 +445,7 @@ mod timeline_performance_tests {
         println!("Insert time: {:?}", insert_start.elapsed());
 
         // Force flush to disk
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&db.pool)
-            .await
-            .ok();
+        db.wal_checkpoint().await.ok();
 
         let query_start = Instant::now();
         let result = db.find_video_chunks(start_time, end_time).await.unwrap();
@@ -460,8 +466,8 @@ mod timeline_performance_tests {
             println!("\nWARNING: Query > 500ms - user will notice delay");
         }
 
-        // Cleanup
-        let _ = std::fs::remove_file(db_path);
+        // Close before TempDir removes the database and its WAL sidecars.
+        db.close().await;
     }
 
     /// Test the actual query that's used (check if JOINs are the bottleneck)

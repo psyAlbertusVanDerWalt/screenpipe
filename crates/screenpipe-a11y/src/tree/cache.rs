@@ -98,9 +98,13 @@ mod tests {
     fn make_snapshot(app: &str, window: &str, text: &str) -> TreeSnapshot {
         TreeSnapshot {
             app_name: app.to_string(),
+            app_id: None,
+            executable: None,
+            app_version: None,
             window_name: window.to_string(),
             text_content: text.to_string(),
             nodes: vec![],
+            semantic_nodes: vec![],
             browser_url: None,
             document_path: None,
             timestamp: Utc::now(),
@@ -111,6 +115,7 @@ mod tests {
             truncated: false,
             truncation_reason: TruncationReason::None,
             max_depth_reached: 0,
+            window_bounds: None,
         }
     }
 

@@ -8,6 +8,7 @@ import { PostHogProvider } from "posthog-js/react";
 import { useEffect, useState, Suspense } from "react";
 import { ChangelogDialogProvider } from "@/lib/hooks/use-changelog-dialog";
 import { SettingsProvider } from "@/lib/hooks/use-settings";
+import { ManagedPolicyProvider } from "@/lib/hooks/use-managed-policy";
 import { ThemeProvider } from "@/components/theme-provider";
 import { PermissionMonitorProvider } from "@/lib/hooks/use-permission-monitor";
 import { AuthGuard } from "@/lib/auth-guard";
@@ -16,8 +17,9 @@ import { NuqsAdapter } from "nuqs/adapters/next/app";
 import { useUpdateListener } from "@/components/update-banner";
 import { AppEntitlementGate } from "@/components/app-entitlement-gate";
 import { DeeplinkHandler } from "@/components/deeplink-handler";
+import { LiveViewOnboardingFollowUp } from "@/components/live-view-onboarding-follow-up";
 import { usePathname } from "next/navigation";
-import { readCachedAnalyticsId } from "@/lib/analytics-id";
+import { readCachedAnalyticsId, readCachedAnalyticsEnabled } from "@/lib/analytics-id";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { queryClient } from "@/lib/query-client";
 
@@ -55,7 +57,8 @@ export const Providers = forwardRef<
   // "sign in required" screen unmounts it and the login token is dropped, so
   // sign-in can never complete and the user is locked out for good.
   const pathname = usePathname();
-  const isOverlay = pathname === "/shortcut-reminder";
+  const isOverlay =
+    pathname === "/shortcut-reminder" || pathname === "/notification-inbox";
   useEffect(() => {
     setMounted(true);
   }, []);
@@ -68,7 +71,11 @@ export const Providers = forwardRef<
       // over every spec (clean localStorage each run = empty dismissed-set) —
       // plus pollute prod analytics with test traffic.
       const isE2E = process.env.NEXT_PUBLIC_SCREENPIPE_E2E === "true";
-      if (isDebug || isE2E) return;
+      const isBrowserDev = Boolean(process.env.NEXT_PUBLIC_SCREENPIPE_WEB_DEV);
+      if (isDebug || isE2E || isBrowserDev) return;
+      // Read the cached analytics preference to sync PostHog opt-in/out
+      // after init. undefined = first boot → allow capturing (default true).
+      const cachedEnabled = readCachedAnalyticsEnabled();
       // Bootstrap with the stable per-install id (mirrors settings.analyticsId,
       // cached by the identify() effect in use-settings) so EVERY event — incl.
       // ones fired by overlay windows like the floating search bar before the
@@ -86,34 +93,46 @@ export const Providers = forwardRef<
           ? { bootstrap: { distinctID: cachedAnalyticsId, isIdentifiedID: true } }
           : {}),
       });
+      // sync opt-in/out with cached preference on every boot
+      if (cachedEnabled === false) {
+        posthog.opt_out_capturing();
+      } else {
+        posthog.opt_in_capturing();
+      }
     }
   }, []);
 
   return (
     <Suspense>
-    <NuqsAdapter>
-      <QueryClientProvider client={queryClient}>
-      <SettingsProvider>
-        <AuthGuard>
-          <ThemeProvider defaultTheme="system" storageKey="screenpipe-ui-theme">
-            <ChangelogDialogProvider>
-              <PermissionMonitorProvider>
-                <UpdateListenerMount />
-                <PostHogProvider client={posthog}>
-                  {mounted ? (
-                    <>
-                      {!isOverlay && <DeeplinkHandler />}
-                      <AppEntitlementGate>{children}</AppEntitlementGate>
-                    </>
-                  ) : null}
-                </PostHogProvider>
-              </PermissionMonitorProvider>
-            </ChangelogDialogProvider>
-          </ThemeProvider>
-        </AuthGuard>
-      </SettingsProvider>
-      </QueryClientProvider>
-    </NuqsAdapter>
+      <NuqsAdapter>
+        <QueryClientProvider client={queryClient}>
+          <SettingsProvider>
+            <ManagedPolicyProvider>
+              <AuthGuard>
+                <ThemeProvider
+                  defaultTheme="system"
+                  storageKey="screenpipe-ui-theme"
+                >
+                  <ChangelogDialogProvider>
+                    <PermissionMonitorProvider>
+                      <UpdateListenerMount />
+                      <PostHogProvider client={posthog}>
+                        {mounted ? (
+                          <>
+                            {!isOverlay && <DeeplinkHandler />}
+                            {!isOverlay && <LiveViewOnboardingFollowUp />}
+                            <AppEntitlementGate>{children}</AppEntitlementGate>
+                          </>
+                        ) : null}
+                      </PostHogProvider>
+                    </PermissionMonitorProvider>
+                  </ChangelogDialogProvider>
+                </ThemeProvider>
+              </AuthGuard>
+            </ManagedPolicyProvider>
+          </SettingsProvider>
+        </QueryClientProvider>
+      </NuqsAdapter>
     </Suspense>
   );
 });

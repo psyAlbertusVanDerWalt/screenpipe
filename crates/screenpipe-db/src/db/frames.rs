@@ -812,11 +812,13 @@ impl DatabaseManager {
         frame_id: i64,
         text_source: &str,
     ) -> Result<(), anyhow::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
         sqlx::query("UPDATE frames SET text_source = ?1 WHERE id = ?2")
             .bind(text_source)
             .bind(frame_id)
-            .execute(&self.pool)
+            .execute(&mut **tx.conn())
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1164,17 +1166,17 @@ impl DatabaseManager {
 
         // Execute queries in parallel
         let (frame_rows, audio_rows, live_rows) = tokio::try_join!(
-            sqlx::query(&frames_query)
+            sqlx::query(sqlx::AssertSqlSafe(frames_query))
                 .bind(start)
                 .bind(end)
                 .bind(frame_limit)
                 .fetch_all(&self.pool),
-            sqlx::query(&audio_query)
+            sqlx::query(sqlx::AssertSqlSafe(audio_query))
                 .bind(start)
                 .bind(end)
                 .bind(aux_limit)
                 .fetch_all(&self.pool),
-            sqlx::query(&live_query)
+            sqlx::query(sqlx::AssertSqlSafe(live_query))
                 .bind(start)
                 .bind(end)
                 .bind(aux_limit)
@@ -1422,11 +1424,13 @@ impl DatabaseManager {
 
     // Add method to update frame names
     pub async fn update_frame_name(&self, frame_id: i64, name: &str) -> Result<(), sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
         sqlx::query("UPDATE frames SET name = ?1 WHERE id = ?2")
             .bind(name)
             .bind(frame_id)
-            .execute(&self.pool)
+            .execute(&mut **tx.conn())
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1436,11 +1440,13 @@ impl DatabaseManager {
         video_chunk_id: i64,
         name: &str,
     ) -> Result<(), sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
         sqlx::query("UPDATE frames SET name = ?1 WHERE video_chunk_id = ?2")
             .bind(name)
             .bind(video_chunk_id)
-            .execute(&self.pool)
+            .execute(&mut **tx.conn())
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 }

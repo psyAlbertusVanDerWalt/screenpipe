@@ -12,10 +12,11 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use screenpipe_events::PermissionKind;
 use screenpipe_screen::monitor::{list_monitors_detailed, MonitorListError};
 
-use super::manager::{VisionManager, VisionManagerStatus};
+use super::manager::{
+    MonitorLivenessSnapshot, VisionManager, VisionManagerStatus, ZERO_DISPLAYS_ENUMERATED,
+};
 use crate::drm_detector;
 use crate::permission_monitor;
 
@@ -24,13 +25,13 @@ static MONITOR_WATCHER: Lazy<Mutex<Option<JoinHandle<()>>>> = Lazy::new(|| Mutex
 // ── Silent-wedge watchdog (#3939) ───────────────────────────────────────────
 //
 // Symptom: VisionManager status stays `Running` and the tray shows "Recording",
-// but the capture loop has stopped persisting frames — for ~1h in the original
-// report — with no auto-recovery. The existing recovery paths all miss it: the
-// monitor watcher only restarts when status != Running, and the /health stall
-// flag only colors the response, nothing acts on it.
+// but the capture loop has stopped reaching terminal outcomes — for ~1h in the
+// original report — with no auto-recovery. The existing recovery paths all miss
+// it: the monitor watcher only restarts when status != Running, and the /health
+// stall flag only colors the response, nothing acts on it.
 //
-// Detection: a healthy pipeline ticks `last_db_write_ts` on every DB write AND
-// on every dedup-skip (a static screen: idle user, slide deck, video call). So
+// Detection: a healthy pipeline ticks the historical `last_db_write_ts` clock
+// on every DB write, dedup-skip, and explicit corrupt-frame skip. So
 // "capture attempts still fresh while `last_db_write_ts` has been frozen for a
 // long time" cannot happen on a healthy idle screen — it only happens when
 // captures are erroring/timing out (DB write pool saturated after a disk-I/O
@@ -45,7 +46,7 @@ static MONITOR_WATCHER: Lazy<Mutex<Option<JoinHandle<()>>>> = Lazy::new(|| Mutex
 /// The capture loop must still be issuing attempts this recently for the wedge
 /// to be the restartable "still-attempting" kind.
 const WEDGE_ATTEMPT_FRESH_SECS: u64 = 60;
-/// No frame persisted (write or dedup-skip) for at least this long while
+/// No terminal outcome for at least this long while
 /// attempts stay fresh → wedged. Deliberately looser than the /health stall
 /// threshold (60s) because the action here (a capture restart) is disruptive.
 const WEDGE_DB_STALE_SECS: u64 = 120;
@@ -69,21 +70,63 @@ const WEDGE_RESTART_COOLDOWN: Duration = Duration::from_secs(300);
 // frames (only an OS display reconfigure on lock/unlock unwedged it).
 //
 // Same heartbeat, same low-FP reasoning: a healthy pipeline ticks
-// `last_db_write_ts` on every write AND every dedup-skip, even on a fully static
-// screen — so a long-frozen heartbeat past warm-up is broken capture regardless
-// of whether attempts are still fresh. Restarting is safe here because
-// `VisionManager::stop` aborts with a bounded timeout (it can't hang on a wedged
-// loop). Shares `WEDGE_RESTART_COOLDOWN` with the still-attempting path.
+// `last_db_write_ts` on every write, dedup-skip, and explicit corrupt-frame skip,
+// even on a fully static screen — so a long-frozen heartbeat past warm-up is
+// broken capture regardless of whether attempts are still fresh. Restarting is
+// safe here because `VisionManager::stop` aborts with a bounded timeout (it
+// can't hang on a wedged loop). Shares `WEDGE_RESTART_COOLDOWN` with the
+// still-attempting path.
 
-/// No frame persisted for at least this long (loop no longer attempting) →
+/// No terminal outcome for at least this long (loop no longer attempting) →
 /// gone-silent. Higher than `WEDGE_DB_STALE_SECS` because we can't lean on a
 /// fresh attempt heartbeat to confirm the rest of the pipeline is alive, so we
 /// want extra confirmation before the disruptive restart.
 const SILENT_DB_STALE_SECS: u64 = 240;
 /// Up this long with the loop having attempted at least once but never
-/// persisting a single frame → started-but-never-produced. Generous so a slow
-/// first model load / device probe is never mistaken for a stall.
+/// reaching a single terminal outcome → started-but-never-produced. Generous so
+/// a slow first model load / device probe is never mistaken for a stall.
 const SILENT_NEVER_PRODUCED_UPTIME_SECS: f64 = 240.0;
+
+#[derive(Clone, Copy)]
+struct VisionWatchdogConfig {
+    attempt_fresh_secs: u64,
+    db_stale_secs: u64,
+    min_uptime_secs: f64,
+    restart_cooldown: Duration,
+    silent_db_stale_secs: u64,
+    silent_never_produced_uptime_secs: f64,
+    monitor_backstop: Duration,
+}
+
+const PRODUCTION_VISION_WATCHDOG: VisionWatchdogConfig = VisionWatchdogConfig {
+    attempt_fresh_secs: WEDGE_ATTEMPT_FRESH_SECS,
+    db_stale_secs: WEDGE_DB_STALE_SECS,
+    min_uptime_secs: WEDGE_MIN_UPTIME_SECS,
+    restart_cooldown: WEDGE_RESTART_COOLDOWN,
+    silent_db_stale_secs: SILENT_DB_STALE_SECS,
+    silent_never_produced_uptime_secs: SILENT_NEVER_PRODUCED_UPTIME_SECS,
+    monitor_backstop: Duration::from_secs(60),
+};
+
+fn vision_watchdog_config() -> VisionWatchdogConfig {
+    #[cfg(debug_assertions)]
+    if crate::event_driven_capture::e2e_capture_loop_silent_fault_armed() {
+        // Fast enough to exercise the complete failure → visible incident →
+        // watchdog recovery path in CI, while preserving threshold ordering.
+        // The explicit arm is load-bearing: selecting the seed must not make a
+        // slow first real capture look like the injected post-baseline stall.
+        return VisionWatchdogConfig {
+            attempt_fresh_secs: 2,
+            db_stale_secs: 5,
+            min_uptime_secs: 2.0,
+            restart_cooldown: Duration::from_secs(30),
+            silent_db_stale_secs: 8,
+            silent_never_produced_uptime_secs: 8.0,
+            monitor_backstop: Duration::from_secs(1),
+        };
+    }
+    PRODUCTION_VISION_WATCHDOG
+}
 
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
@@ -94,39 +137,74 @@ fn now_epoch_secs() -> u64 {
 
 /// Pure decision: is vision capture in the restartable "still-attempting" wedge?
 /// Kept free of clocks and I/O so it can be unit-tested with synthetic inputs.
+#[cfg(test)]
 fn vision_capture_wedged(
     uptime_secs: f64,
     last_capture_attempt_ts: u64,
     last_db_write_ts: u64,
     now_ts: u64,
 ) -> bool {
-    uptime_secs > WEDGE_MIN_UPTIME_SECS
+    vision_capture_wedged_with(
+        &PRODUCTION_VISION_WATCHDOG,
+        uptime_secs,
+        last_capture_attempt_ts,
+        last_db_write_ts,
+        now_ts,
+    )
+}
+
+fn vision_capture_wedged_with(
+    config: &VisionWatchdogConfig,
+    uptime_secs: f64,
+    last_capture_attempt_ts: u64,
+    last_db_write_ts: u64,
+    now_ts: u64,
+) -> bool {
+    uptime_secs > config.min_uptime_secs
         // loop is alive and still issuing capture attempts (heartbeat fresh)
         && last_capture_attempt_ts > 0
-        && now_ts.saturating_sub(last_capture_attempt_ts) < WEDGE_ATTEMPT_FRESH_SECS
-        // ...but nothing has persisted (write or dedup-skip) for a long while.
-        // last_db_write_ts == 0 means "never written yet" (warming up), not a stall.
+        && now_ts.saturating_sub(last_capture_attempt_ts) < config.attempt_fresh_secs
+        // ...but no attempt has reached a terminal outcome for a long while.
+        // last_db_write_ts == 0 means "no terminal outcome yet" (warming up), not a stall.
         && last_db_write_ts > 0
-        && now_ts.saturating_sub(last_db_write_ts) > WEDGE_DB_STALE_SECS
+        && now_ts.saturating_sub(last_db_write_ts) > config.db_stale_secs
 }
 
 /// Pure decision: has vision capture gone fully silent — status would be
-/// `Running` (checked by the caller) but no frame has persisted for a long time
-/// while the loop is no longer even attempting, so [`vision_capture_wedged`]
-/// won't fire? Covers two shapes the other recovery paths miss:
-/// - **went-silent**: wrote frames once, then both writes and attempts stopped
+/// `Running` (checked by the caller) but no attempt has reached a terminal
+/// outcome for a long time while the loop is no longer even attempting, so
+/// [`vision_capture_wedged`] won't fire? Covers two shapes the other recovery
+/// paths miss:
+/// - **went-silent**: completed captures once, then both outcomes and attempts stopped
 ///   (frozen SCK stream + parked loop, or an exited capture task).
-/// - **never-produced**: attempted but never persisted a single frame well past
-///   warm-up.
+/// - **never-produced**: attempted but never reached a single terminal outcome
+///   well past warm-up.
 ///
 /// Clock-free for unit testing, mirroring [`vision_capture_wedged`].
+#[cfg(test)]
 fn vision_capture_silent(
     uptime_secs: f64,
     last_capture_attempt_ts: u64,
     last_db_write_ts: u64,
     now_ts: u64,
 ) -> bool {
-    if uptime_secs <= WEDGE_MIN_UPTIME_SECS {
+    vision_capture_silent_with(
+        &PRODUCTION_VISION_WATCHDOG,
+        uptime_secs,
+        last_capture_attempt_ts,
+        last_db_write_ts,
+        now_ts,
+    )
+}
+
+fn vision_capture_silent_with(
+    config: &VisionWatchdogConfig,
+    uptime_secs: f64,
+    last_capture_attempt_ts: u64,
+    last_db_write_ts: u64,
+    now_ts: u64,
+) -> bool {
+    if uptime_secs <= config.min_uptime_secs {
         return false;
     }
     // Loop must have attempted at least once: if it never even attempted, a
@@ -136,16 +214,196 @@ fn vision_capture_silent(
         return false;
     }
     let attempts_stopped =
-        now_ts.saturating_sub(last_capture_attempt_ts) >= WEDGE_ATTEMPT_FRESH_SECS;
+        now_ts.saturating_sub(last_capture_attempt_ts) >= config.attempt_fresh_secs;
 
     let went_silent = last_db_write_ts > 0
-        && now_ts.saturating_sub(last_db_write_ts) > SILENT_DB_STALE_SECS
+        && now_ts.saturating_sub(last_db_write_ts) > config.silent_db_stale_secs
         && attempts_stopped;
 
-    let never_produced = last_db_write_ts == 0 && uptime_secs > SILENT_NEVER_PRODUCED_UPTIME_SECS;
+    let never_produced =
+        last_db_write_ts == 0 && uptime_secs > config.silent_never_produced_uptime_secs;
 
     went_silent || never_produced
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VisionStallKind {
+    StillAttempting,
+    GoneSilent,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DetectedVisionStall {
+    monitor_id: u32,
+    kind: VisionStallKind,
+    uptime_secs: f64,
+    last_capture_attempt_ts: u64,
+    last_db_write_ts: u64,
+}
+
+fn classify_vision_stall(
+    config: &VisionWatchdogConfig,
+    capture_expected: bool,
+    uptime_secs: f64,
+    last_capture_attempt_ts: u64,
+    last_db_write_ts: u64,
+    now_ts: u64,
+) -> Option<VisionStallKind> {
+    if !capture_expected {
+        return None;
+    }
+    if vision_capture_wedged_with(
+        config,
+        uptime_secs,
+        last_capture_attempt_ts,
+        last_db_write_ts,
+        now_ts,
+    ) {
+        Some(VisionStallKind::StillAttempting)
+    } else if vision_capture_silent_with(
+        config,
+        uptime_secs,
+        last_capture_attempt_ts,
+        last_db_write_ts,
+        now_ts,
+    ) {
+        Some(VisionStallKind::GoneSilent)
+    } else {
+        None
+    }
+}
+
+/// Inspect independent monitor clocks rather than the aggregate health clock.
+/// A healthy display continuously advances the aggregate timestamps, which
+/// would otherwise conceal a sibling display whose capture loop is silent.
+fn first_monitor_stall(
+    config: &VisionWatchdogConfig,
+    capture_expected: bool,
+    snapshots: &[MonitorLivenessSnapshot],
+    now_ts: u64,
+) -> Option<DetectedVisionStall> {
+    if !capture_expected {
+        return None;
+    }
+    snapshots.iter().find_map(|snap| {
+        classify_vision_stall(
+            config,
+            true,
+            snap.uptime_secs,
+            snap.last_capture_attempt_ts,
+            snap.last_db_write_ts,
+            now_ts,
+        )
+        .map(|kind| DetectedVisionStall {
+            monitor_id: snap.monitor_id,
+            kind,
+            uptime_secs: snap.uptime_secs,
+            last_capture_attempt_ts: snap.last_capture_attempt_ts,
+            last_db_write_ts: snap.last_db_write_ts,
+        })
+    })
+}
+
+/// Capture is expected only when policy permits it and at least one connected,
+/// selected, awake display is not explicitly user-paused.
+fn watchdog_capture_expected(system_paused: bool, expected_monitor_count: usize) -> bool {
+    !system_paused && expected_monitor_count > 0
+}
+
+fn restart_cooldown_elapsed(
+    config: &VisionWatchdogConfig,
+    elapsed_since_restart: Option<Duration>,
+) -> bool {
+    elapsed_since_restart
+        .map(|elapsed| elapsed >= config.restart_cooldown)
+        .unwrap_or(true)
+}
+
+/// Pure step function for the anomalous-empty-enumeration counter — how many
+/// consecutive passes SCK returned zero displays while CG topology said
+/// capture should be possible. Clock- and FFI-free for unit testing.
+///
+/// - `screen_locked` → a locked session yields an empty SCK list with the
+///   displays still lit, so the empty list is fully explained: benign, reset.
+///   (The rest of the codebase already treats a locked screen as "no captures
+///   expected" rather than a fault.)
+/// - `Some(non-empty)` capture-ready set → awake displays exist yet SCK sees
+///   none: genuinely anomalous, count it.
+/// - `Some(empty)` → every display is asleep/inactive (clamshell, Energy-Saver
+///   display sleep) and none could be captured anyway: benign, reset (the
+///   episode is over; a later anomaly must re-earn the threshold).
+/// - `None` → CG topology unreadable = unknown; callers MUST NOT infer a
+///   degraded topology from it (same discipline as the audio SCK watchdog's
+///   `usable_display_ids`), so hold the count — neither escalate toward the
+///   threshold nor erase progress on a transient CG error.
+///
+/// The set MUST come from `capture_ready_display_ids`, not `usable_display_ids`:
+/// the latter deliberately keeps a sleeping EXTERNAL display, which would make
+/// ordinary display sleep on any multi-display Mac read as a revoked grant.
+fn next_anomalous_empty_count(
+    current: u32,
+    capture_ready: Option<&std::collections::BTreeSet<u32>>,
+    screen_locked: bool,
+) -> u32 {
+    if screen_locked {
+        return 0;
+    }
+    match capture_ready {
+        Some(set) if !set.is_empty() => current.saturating_add(1),
+        Some(_) => 0,
+        None => current,
+    }
+}
+
+/// One pass of the "SCK enumerated zero displays" classifier, shared by every
+/// site that can observe an empty enumeration (startup init, the not-Running
+/// `start()` retry, and the steady-state `NoMonitorsFound` arm). Without the
+/// first two, a process that starts with the grant already lapsed never reaches
+/// the steady-state arm at all — `start()` fails, the loop parks in the retry
+/// branch, and the silent failure goes unreported for the whole session.
+///
+/// Steps `counter` and, at [`NO_MONITORS_PERMISSION_THRESHOLD`], reports the
+/// enumeration verdict. Returns `true` when it escalated (caller backs off).
+fn classify_empty_enumeration(counter: &mut u32, denied_logged: &mut bool, site: &str) -> bool {
+    // A locked screen enumerates zero displays with the grant fully intact, so
+    // it can never be evidence of a lapse. Non-macOS never escalates (headless
+    // Linux / Windows RDP can legitimately have zero monitors).
+    let screen_locked = cfg!(target_os = "macos") && crate::sleep_monitor::screen_is_locked();
+    let capture_ready = if cfg!(target_os = "macos") {
+        screenpipe_core::display_topology::capture_ready_display_ids()
+    } else {
+        None
+    };
+    *counter = next_anomalous_empty_count(*counter, capture_ready.as_ref(), screen_locked);
+    if *counter < NO_MONITORS_PERMISSION_THRESHOLD {
+        return false;
+    }
+    if !*denied_logged {
+        warn!(
+            "SCK enumerated no displays {} times in a row ({}) while CoreGraphics reports {} \
+             awake display(s) — screen recording permission is likely revoked or awaiting \
+             re-approval. Grant access in System Settings > Privacy & Security > Screen Recording",
+            *counter,
+            site,
+            capture_ready.as_ref().map(|s| s.len()).unwrap_or(0)
+        );
+        *denied_logged = true;
+    }
+    // Every pass, not once per episode: a report landing inside the post-wake
+    // grace window is swallowed by design, and the verdict is only committed on
+    // a delivered report — so repeating is what makes the episode survive.
+    permission_monitor::report_screen_enumeration(
+        false,
+        Some("SCK enumerated no displays while CG reports awake displays (stale screen-recording grant)"),
+    );
+    true
+}
+
+/// Consecutive empty-enumeration passes required before blaming the grant.
+/// At the surrounding back-off cadence this is ~15s — long enough that a
+/// transient enumeration hiccup can't trip it, short enough that a real lapse
+/// surfaces while the user is still at the machine.
+const NO_MONITORS_PERMISSION_THRESHOLD: u32 = 3;
 
 /// Start the monitor watcher that polls for monitor changes.
 /// When `audio_manager` is provided, SCK-based (output) audio devices are also
@@ -236,6 +494,19 @@ pub async fn start_monitor_watcher(
         let mut known_monitors: HashMap<u32, String> = HashMap::new();
         // Track permission state to avoid log spam
         let mut permission_denied_logged = false;
+        // Consecutive passes where SCK enumerated zero displays WHILE
+        // CoreGraphics reported at least one AWAKE display and the screen was
+        // unlocked. An empty SCK list on its own is NOT evidence of a
+        // permission problem — display sleep, clamshell and screen lock all
+        // produce it legitimately (empirically verified on macOS 26.4: granted
+        // + display asleep → SCShareableContent OK with 0 displays; see PR
+        // #5393 review). But CG topology is readable without the
+        // screen-recording grant, so "CG sees awake displays, SCK persistently
+        // sees none" is the anomalous state — the silent capture-loss shape
+        // that ran for whole days in the wild while the stale TCC preflight
+        // kept reporting granted. Only that combination escalates; see
+        // `classify_empty_enumeration`.
+        let mut consecutive_anomalous_empty: u32 = 0;
         // Track whether we stopped monitors due to DRM
         let mut drm_stopped = false;
         // Track whether we stopped recording due to work-hours schedule
@@ -272,14 +543,32 @@ pub async fn start_monitor_watcher(
                     known_monitors.insert(monitor.id(), monitor.name().to_string());
                 }
                 permission_denied_logged = false;
+                // A successful enumeration is the only thing that can lift a
+                // stale verdict left by an earlier watcher in this process, so
+                // it must be reported from here too — not just from the loop.
+                if permission_monitor::screen_enumeration_denied() {
+                    info!("Screen recording enumeration recovered at watcher startup");
+                    permission_monitor::report_screen_enumeration(true, None);
+                }
             }
             Err(MonitorListError::PermissionDenied) => {
                 warn!("Screen recording permission denied. Vision capture is disabled. Grant access in System Settings > Privacy & Security > Screen Recording");
                 permission_denied_logged = true;
-                permission_monitor::report_state(
-                    PermissionKind::ScreenRecording,
+                permission_monitor::report_screen_enumeration(
                     false,
                     Some("list_monitors PermissionDenied (startup)"),
+                );
+            }
+            Err(MonitorListError::NoMonitorsFound) => {
+                // Classify it here too: in the lapsed-grant state SCK succeeds
+                // with an empty list, which surfaces as NoMonitorsFound (not
+                // PermissionDenied). Falling through to the generic arm below
+                // meant a process that launched with the grant already lapsed
+                // never classified the signal at all.
+                classify_empty_enumeration(
+                    &mut consecutive_anomalous_empty,
+                    &mut permission_denied_logged,
+                    "startup",
                 );
             }
             Err(e) => {
@@ -413,6 +702,11 @@ pub async fn start_monitor_watcher(
                     Ok(()) => {
                         info!("VisionManager recovered after previous start failure");
                         recovery_retry_warned = false;
+                        consecutive_anomalous_empty = 0;
+                        if permission_monitor::screen_enumeration_denied() {
+                            permission_denied_logged = false;
+                            permission_monitor::report_screen_enumeration(true, None);
+                        }
                         if let Ok(monitors) = list_monitors_detailed().await {
                             known_monitors = monitors
                                 .iter()
@@ -427,62 +721,181 @@ pub async fn start_monitor_watcher(
                             warn!(?e, "VisionManager retry failed; will keep retrying");
                             recovery_retry_warned = true;
                         }
+                        // The loop parks in this branch for as long as start()
+                        // keeps failing, so it never reaches the steady-state
+                        // NoMonitorsFound arm below. Classify from here as well
+                        // or a grant that lapsed before launch is never reported.
+                        if e.to_string().contains(ZERO_DISPLAYS_ENUMERATED) {
+                            classify_empty_enumeration(
+                                &mut consecutive_anomalous_empty,
+                                &mut permission_denied_logged,
+                                "VisionManager start retry",
+                            );
+                        } else {
+                            consecutive_anomalous_empty = 0;
+                        }
                     }
                 }
                 continue;
             }
 
+            // Get currently connected monitors with detailed error info
+            let current_monitors = match list_monitors_detailed().await {
+                Ok(monitors) => {
+                    consecutive_anomalous_empty = 0;
+                    if permission_denied_logged {
+                        info!("Screen recording permission granted! Starting vision capture.");
+                        permission_denied_logged = false;
+                    }
+                    // Gate the clear on the PROCESS-GLOBAL verdict, never on the
+                    // task-local log latch: that latch is re-created false by
+                    // every start_monitor_watcher call, so a watcher restarted
+                    // after an escalation (tray stop/start, Apply & Restart,
+                    // health respawn, the recovery window's own stop+spawn)
+                    // would enumerate displays fine and still leave the verdict
+                    // latched — permanently denying screen recording for the
+                    // rest of the process and refusing every later start.
+                    if permission_monitor::screen_enumeration_denied() {
+                        permission_monitor::report_screen_enumeration(true, None);
+                    }
+                    monitors
+                }
+                Err(MonitorListError::PermissionDenied) => {
+                    consecutive_anomalous_empty = 0;
+                    vision_manager.set_monitor_capture_expected(
+                        !vision_manager.all_expected_monitors_user_disabled(),
+                    );
+                    if !permission_denied_logged {
+                        warn!("Screen recording permission denied. Vision capture is disabled. Grant access in System Settings > Privacy & Security > Screen Recording");
+                        permission_denied_logged = true;
+                    }
+                    // Report every denied pass, not once per episode: a report
+                    // landing inside the post-wake grace window is swallowed by
+                    // design, so a once-only report could lose the episode
+                    // entirely. report_state dedups transitions, so repeats
+                    // after the first delivered one are no-ops.
+                    permission_monitor::report_screen_enumeration(
+                        false,
+                        Some("list_monitors PermissionDenied (runtime)"),
+                    );
+                    // Back off to 30s when permission is denied instead of 2s
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    continue;
+                }
+                Err(MonitorListError::NoMonitorsFound) => {
+                    #[cfg(target_os = "macos")]
+                    if let Some(capture_ready) =
+                        screenpipe_core::display_topology::capture_ready_display_ids()
+                    {
+                        vision_manager.set_monitor_capture_expected(
+                            !capture_ready.is_empty()
+                                && !vision_manager.all_expected_monitors_user_disabled(),
+                        );
+                    }
+                    // Classify the empty list (screen lock + CG topology, both
+                    // readable without the screen-recording grant) before
+                    // treating it as suspicious.
+                    if classify_empty_enumeration(
+                        &mut consecutive_anomalous_empty,
+                        &mut permission_denied_logged,
+                        "runtime",
+                    ) {
+                        // Same back-off as the explicit PermissionDenied path.
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        continue;
+                    }
+                    debug!("No monitors found, will retry");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                Err(e) => {
+                    consecutive_anomalous_empty = 0;
+                    warn!("Failed to list monitors: {}", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            let current_ids: HashSet<u32> = current_monitors.iter().map(|m| m.id()).collect();
+
             // ── Capture stall watchdog (#3939) ──────────────────────────────
-            // status == Running, but is the loop actually persisting frames?
-            // Two restartable shapes (see the module-level comments):
-            //   - still-attempting wedge: attempts fresh, write path stalled
-            //     (DB pool saturated) — `vision_capture_wedged`.
-            //   - gone-silent / never-produced: heartbeat frozen and the loop
-            //     stopped even attempting (frozen SCK stream + parked loop, an
-            //     exited task, or a pipeline that never produced) —
-            //     `vision_capture_silent`.
-            // Both are cooldown-gated so a stall a restart can't fix can't cause
-            // a restart storm, and neither fires on a healthy static screen.
+            // Enumerate first so recovery is based on the displays that should
+            // actually be recording now. This excludes explicit per-monitor
+            // user pauses and asleep/inactive displays, while per-monitor
+            // heartbeat clocks ensure one healthy display cannot mask a frozen
+            // sibling loop.
             {
+                #[cfg(target_os = "macos")]
+                let capture_ready_ids =
+                    screenpipe_core::display_topology::capture_ready_display_ids();
+                #[cfg(not(target_os = "macos"))]
+                let capture_ready_ids: Option<std::collections::BTreeSet<u32>> = None;
+
+                let selected_ids: HashSet<u32> = current_monitors
+                    .iter()
+                    .filter(|monitor| vision_manager.is_monitor_allowed(monitor))
+                    .map(|monitor| monitor.id())
+                    .collect();
+                vision_manager.set_expected_monitors(selected_ids.iter().copied());
+
+                let expected_ids: HashSet<u32> = current_monitors
+                    .iter()
+                    .filter(|monitor| selected_ids.contains(&monitor.id()))
+                    .filter(|monitor| !vision_manager.is_monitor_user_disabled(monitor.id()))
+                    .filter(|monitor| {
+                        capture_ready_ids
+                            .as_ref()
+                            .map(|ids| ids.contains(&monitor.id()))
+                            .unwrap_or(true)
+                    })
+                    .map(|monitor| monitor.id())
+                    .collect();
+                let system_paused = crate::sleep_monitor::screen_is_locked()
+                    || crate::sleep_monitor::recently_woke_from_sleep()
+                    || vision_manager.power_capture_paused();
+                let capture_expected = watchdog_capture_expected(system_paused, expected_ids.len());
+                vision_manager.set_monitor_capture_expected(capture_expected);
+                let monitor_snaps: Vec<MonitorLivenessSnapshot> = vision_manager
+                    .monitor_liveness_snapshots()
+                    .into_iter()
+                    .filter(|snap| expected_ids.contains(&snap.monitor_id))
+                    .collect();
+
+                // Resolve dynamically: the debug E2E profile becomes active
+                // only after the spec explicitly arms it following a healthy
+                // terminal capture baseline.
+                let watchdog = vision_watchdog_config();
                 let now_ts = now_epoch_secs();
-                let snap = vision_manager.vision_metrics().snapshot();
-                let wedged = vision_capture_wedged(
-                    snap.uptime_secs,
-                    snap.last_capture_attempt_ts,
-                    snap.last_db_write_ts,
-                    now_ts,
-                );
-                let silent = vision_capture_silent(
-                    snap.uptime_secs,
-                    snap.last_capture_attempt_ts,
-                    snap.last_db_write_ts,
-                    now_ts,
-                );
-                let cooldown_ok = last_vision_restart
-                    .map(|t| t.elapsed() >= WEDGE_RESTART_COOLDOWN)
-                    .unwrap_or(true);
-                if (wedged || silent) && cooldown_ok {
-                    let db_stale = now_ts.saturating_sub(snap.last_db_write_ts);
-                    let attempt_age = now_ts.saturating_sub(snap.last_capture_attempt_ts);
-                    let reason = if wedged {
-                        "still-attempting wedge"
+                let stall =
+                    first_monitor_stall(&watchdog, capture_expected, &monitor_snaps, now_ts);
+                let cooldown_ok =
+                    restart_cooldown_elapsed(&watchdog, last_vision_restart.map(|t| t.elapsed()));
+                if let Some(stall) = stall.filter(|_| cooldown_ok) {
+                    let db_stale = if stall.last_db_write_ts == 0 {
+                        stall.uptime_secs as u64
                     } else {
-                        "gone-silent stall"
+                        now_ts.saturating_sub(stall.last_db_write_ts)
+                    };
+                    let attempt_age = now_ts.saturating_sub(stall.last_capture_attempt_ts);
+                    let reason = match stall.kind {
+                        VisionStallKind::StillAttempting => "still-attempting wedge",
+                        VisionStallKind::GoneSilent => "gone-silent stall",
                     };
                     warn!(
-                        "vision capture stalled ({}): status=Running, last attempt {}s ago, \
-                         no frame persisted for {}s — restarting VisionManager (#3939)",
-                        reason, attempt_age, db_stale
+                        "vision capture stalled on monitor {} ({}): status=Running, last attempt {}s ago, \
+                         no terminal capture outcome for {}s — restarting VisionManager (#3939)",
+                        stall.monitor_id, reason, attempt_age, db_stale
                     );
                     let _ = screenpipe_events::send_event(
                         "vision_capture_wedge_restart",
                         serde_json::json!({
+                            "monitor_id": stall.monitor_id,
                             "reason": reason,
                             "db_stale_secs": db_stale,
                             "attempt_age_secs": attempt_age,
-                            "uptime_secs": snap.uptime_secs,
+                            "uptime_secs": stall.uptime_secs,
                         }),
                     );
+                    crate::event_driven_capture::e2e_complete_capture_loop_silent_fault();
                     if let Err(e) = vision_manager.stop().await {
                         warn!("wedge watchdog: vision stop failed: {:?}", e);
                     }
@@ -504,47 +917,6 @@ pub async fn start_monitor_watcher(
                     continue;
                 }
             }
-
-            // Get currently connected monitors with detailed error info
-            let current_monitors = match list_monitors_detailed().await {
-                Ok(monitors) => {
-                    if permission_denied_logged {
-                        info!("Screen recording permission granted! Starting vision capture.");
-                        permission_denied_logged = false;
-                        permission_monitor::report_state(
-                            PermissionKind::ScreenRecording,
-                            true,
-                            None,
-                        );
-                    }
-                    monitors
-                }
-                Err(MonitorListError::PermissionDenied) => {
-                    if !permission_denied_logged {
-                        warn!("Screen recording permission denied. Vision capture is disabled. Grant access in System Settings > Privacy & Security > Screen Recording");
-                        permission_denied_logged = true;
-                        permission_monitor::report_state(
-                            PermissionKind::ScreenRecording,
-                            false,
-                            Some("list_monitors PermissionDenied (runtime)"),
-                        );
-                    }
-                    // Back off to 30s when permission is denied instead of 2s
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                    continue;
-                }
-                Err(MonitorListError::NoMonitorsFound) => {
-                    debug!("No monitors found, will retry");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-                Err(e) => {
-                    warn!("Failed to list monitors: {}", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
-            let current_ids: HashSet<u32> = current_monitors.iter().map(|m| m.id()).collect();
 
             // Persist a display-layout snapshot when the arrangement changed
             // (origins/sizes/primary — not just the id set). Cheap when
@@ -613,7 +985,7 @@ pub async fn start_monitor_watcher(
                     // later disconnect can still report a human-readable name.
                     known_monitors.insert(monitor_id, monitor.name().to_string());
 
-                    match vision_manager.start_monitor(monitor_id).await {
+                    match vision_manager.start_monitor_handle(monitor.clone()).await {
                         Ok(()) => {
                             added.push(serde_json::json!({
                                 "id": monitor_id,
@@ -684,10 +1056,11 @@ pub async fn start_monitor_watcher(
             //      regress to once-a-minute)
             #[cfg(target_os = "macos")]
             {
+                let watchdog = vision_watchdog_config();
                 let backstop = if crate::sleep_monitor::display_reconfig_callback_registered() {
-                    Duration::from_secs(60)
+                    watchdog.monitor_backstop
                 } else {
-                    Duration::from_secs(5)
+                    watchdog.monitor_backstop.min(Duration::from_secs(5))
                 };
                 let notify = crate::sleep_monitor::display_reconfig_notify();
                 tokio::select! {
@@ -725,6 +1098,34 @@ mod tests {
     const NOW: u64 = 2_000_000_000;
 
     #[test]
+    fn anomalous_empty_counter_only_advances_with_awake_unlocked_displays() {
+        use std::collections::BTreeSet;
+        let awake: BTreeSet<u32> = [1u32].into_iter().collect();
+        let none_awake: BTreeSet<u32> = BTreeSet::new();
+
+        // Awake displays + unlocked + empty SCK list: counts toward the
+        // threshold — the state that ran silent for whole days in the wild.
+        assert_eq!(next_anomalous_empty_count(0, Some(&awake), false), 1);
+        assert_eq!(next_anomalous_empty_count(2, Some(&awake), false), 3);
+
+        // Display sleep / clamshell (nothing capture-ready) explains the empty
+        // list: benign, resets the episode. This is the false positive the
+        // review's macOS 26.4 probe demonstrated (granted + display asleep →
+        // SCShareableContent OK with 0 displays) — it must NEVER escalate.
+        assert_eq!(next_anomalous_empty_count(2, Some(&none_awake), false), 0);
+
+        // Locked screen enumerates zero displays with the displays still lit
+        // and the grant fully intact: benign regardless of CG topology.
+        assert_eq!(next_anomalous_empty_count(2, Some(&awake), true), 0);
+        assert_eq!(next_anomalous_empty_count(2, None, true), 0);
+
+        // CG topology unreadable = unknown: hold, never treat as degraded.
+        assert_eq!(next_anomalous_empty_count(2, None, false), 2);
+        // Non-macOS always passes None → counter can never leave 0.
+        assert_eq!(next_anomalous_empty_count(0, None, false), 0);
+    }
+
+    #[test]
     fn healthy_recent_write_is_not_wedged() {
         // Wrote 1s ago, attempting 1s ago → clearly healthy.
         assert!(!vision_capture_wedged(600.0, NOW - 1, NOW - 1, NOW));
@@ -756,7 +1157,7 @@ mod tests {
 
     #[test]
     fn still_attempting_wedge_is_detected() {
-        // Uptime fine, attempting 3s ago, but nothing persisted for 200s. This
+        // Uptime fine, attempting 3s ago, but no terminal outcome for 200s. This
         // is the #3939 wedge: the loop is alive but every capture is failing.
         assert!(vision_capture_wedged(600.0, NOW - 3, NOW - 200, NOW));
     }
@@ -799,7 +1200,7 @@ mod tests {
 
     #[test]
     fn never_produced_loop_is_detected() {
-        // Loop attempted but never persisted a single frame, well past warm-up.
+        // Loop attempted but never reached a terminal outcome, well past warm-up.
         assert!(vision_capture_silent(600.0, NOW - 5, 0, NOW));
     }
 
@@ -821,6 +1222,108 @@ mod tests {
         // same config won't help (permission/monitor issue handled elsewhere) and
         // could restart-loop → not silent.
         assert!(!vision_capture_silent(600.0, 0, 0, NOW));
+    }
+
+    #[test]
+    fn intentional_pause_states_never_classify_as_stalls() {
+        // The same stale metrics are a real gone-silent fault while capture is
+        // expected, but benign during lock, wake grace, DRM/schedule handling,
+        // or a FullPause power profile (all pass capture_expected=false).
+        assert_eq!(
+            classify_vision_stall(
+                &PRODUCTION_VISION_WATCHDOG,
+                true,
+                600.0,
+                NOW - 300,
+                NOW - 300,
+                NOW,
+            ),
+            Some(VisionStallKind::GoneSilent)
+        );
+        assert_eq!(
+            classify_vision_stall(
+                &PRODUCTION_VISION_WATCHDOG,
+                false,
+                600.0,
+                NOW - 300,
+                NOW - 300,
+                NOW,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn one_healthy_monitor_cannot_mask_a_silent_sibling() {
+        let snapshots = [
+            MonitorLivenessSnapshot {
+                monitor_id: 1,
+                uptime_secs: 600.0,
+                last_capture_attempt_ts: NOW - 1,
+                last_db_write_ts: NOW - 1,
+            },
+            MonitorLivenessSnapshot {
+                monitor_id: 2,
+                uptime_secs: 600.0,
+                last_capture_attempt_ts: NOW - 300,
+                last_db_write_ts: NOW - 300,
+            },
+        ];
+
+        let detected = first_monitor_stall(&PRODUCTION_VISION_WATCHDOG, true, &snapshots, NOW)
+            .expect("silent second monitor must be detected independently");
+        assert_eq!(detected.monitor_id, 2);
+        assert_eq!(detected.kind, VisionStallKind::GoneSilent);
+
+        assert!(
+            first_monitor_stall(&PRODUCTION_VISION_WATCHDOG, false, &snapshots, NOW,).is_none(),
+            "intentional idle suppresses every monitor restart"
+        );
+    }
+
+    #[test]
+    fn watchdog_requires_an_unpaused_capture_ready_monitor() {
+        assert!(watchdog_capture_expected(false, 1));
+        assert!(!watchdog_capture_expected(true, 1));
+        assert!(
+            !watchdog_capture_expected(false, 0),
+            "all displays user-paused or asleep is intentional idle"
+        );
+    }
+
+    #[test]
+    fn restart_cooldown_prevents_recovery_storms() {
+        assert!(restart_cooldown_elapsed(&PRODUCTION_VISION_WATCHDOG, None));
+        assert!(!restart_cooldown_elapsed(
+            &PRODUCTION_VISION_WATCHDOG,
+            Some(Duration::from_secs(299))
+        ));
+        assert!(restart_cooldown_elapsed(
+            &PRODUCTION_VISION_WATCHDOG,
+            Some(Duration::from_secs(300))
+        ));
+    }
+
+    #[test]
+    fn accelerated_profile_preserves_stall_shape_ordering() {
+        let config = VisionWatchdogConfig {
+            attempt_fresh_secs: 2,
+            db_stale_secs: 5,
+            min_uptime_secs: 2.0,
+            restart_cooldown: Duration::from_secs(30),
+            silent_db_stale_secs: 8,
+            silent_never_produced_uptime_secs: 8.0,
+            monitor_backstop: Duration::from_secs(1),
+        };
+        assert_eq!(
+            classify_vision_stall(&config, true, 20.0, NOW - 3, NOW - 7, NOW),
+            None,
+            "gone-silent confirmation must remain slower than still-attempting detection"
+        );
+        assert_eq!(
+            classify_vision_stall(&config, true, 20.0, NOW - 9, NOW - 9, NOW),
+            Some(VisionStallKind::GoneSilent)
+        );
     }
 
     fn mon(name: &str, x: i32, y: i32, w: u32, h: u32, primary: bool) -> MonitorData {
