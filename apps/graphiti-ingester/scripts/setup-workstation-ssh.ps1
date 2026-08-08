@@ -128,17 +128,17 @@ Write-Ok "Granted $PullUser read-only on $ExportDir"
 # ---------------------------------------------------------------------------------------
 Write-Step "Installing the authorized key"
 
-# A non-administrator account uses its own profile. Windows OpenSSH only reads
-# administrators_authorized_keys for members of the Administrators group — which is exactly
-# why this account is deliberately not one.
-$userProfile = "C:\Users\$PullUser"
-if (-not (Test-Path $userProfile)) {
-    New-Item -ItemType Directory -Path $userProfile -Force | Out-Null
-}
-$sshDir = Join-Path $userProfile '.ssh'
-if (-not (Test-Path $sshDir)) { New-Item -ItemType Directory -Path $sshDir -Force | Out-Null }
-
-$authorizedKeys = Join-Path $sshDir 'authorized_keys'
+# Deliberately NOT ~/.ssh/authorized_keys.
+#
+# sshd resolves "~" through the ProfileList registry key, which only gets written when an
+# account first logs on interactively. This account never will, so it has no ProfileList
+# entry and no resolvable home — creating C:\Users\graphiti-pull by hand does not help,
+# because nothing maps the account to it. The symptom is a flat
+# "Permission denied (publickey)" with a key that is perfectly valid.
+#
+# An absolute path under ProgramData sidesteps profile resolution completely. sshd_config
+# below points AuthorizedKeysFile here.
+$authorizedKeys = Join-Path "$env:ProgramData\ssh" "$PullUser`_authorized_keys"
 $existingKeys = if (Test-Path $authorizedKeys) { Get-Content $authorizedKeys } else { @() }
 if ($existingKeys -notcontains $publicKey) {
     Add-Content -Path $authorizedKeys -Value $publicKey -Encoding ascii
@@ -175,6 +175,10 @@ AddressFamily inet
 
 PubkeyAuthentication yes
 PasswordAuthentication no
+
+# Absolute path, not the ~/.ssh default: this account has no Windows profile to expand "~"
+# against, so the default silently never matches. See the note in the script above.
+AuthorizedKeysFile __PROGRAMDATA__/ssh/$PullUser`_authorized_keys
 PermitEmptyPasswords no
 KbdInteractiveAuthentication no
 GSSAPIAuthentication no

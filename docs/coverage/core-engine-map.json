@@ -363,6 +363,25 @@
       "notes": "PostHog capture gating, telemetry context shaping, piggyback telemetry forwarding, crash-log helpers, resource monitoring, and the recording-coverage reliability metric."
     },
     {
+      "id": "engine-redacted-export",
+      "label": "Redacted JSONL export pipeline for the knowledge graph",
+      "crate": "screenpipe-engine",
+      "files": [
+        "src/export/bucket.rs",
+        "src/export/config.rs",
+        "src/export/filters.rs",
+        "src/export/record.rs",
+        "tests/export_pipeline.rs"
+      ],
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["privacy", "storage", "sync", "configuration"],
+      "flows": ["privacy-and-redaction"],
+      "criticality": "high",
+      "confidence": "partial",
+      "kind": "mixed",
+      "notes": "Daily batch export of captured activity as PII-redacted JSONL, run under an OS scheduler rather than inside the capture engine. Covers work-hours and denylist filtering, day bucketing, and the cursor advancing past skipped frames. Redaction is exercised through the deterministic regex-only builder, so the ONNX text-PII path used in production is not covered here — hence partial. mod.rs, cursor_state.rs and the bin entrypoint are driven only via tests/export_pipeline.rs and are omitted because the manifest rejects files carrying no test blocks of their own."
+    },
+    {
       "id": "sqlite-coordinator-durable-quarantine",
       "label": "SQLite coordination and durable quarantine",
       "crate": "screenpipe-sqlite-coordinator",
