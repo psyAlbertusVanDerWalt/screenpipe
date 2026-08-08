@@ -270,10 +270,10 @@ public class DefaultEpisodeGrouper implements EpisodeGrouper {
 
         // A role name prefixed onto real content ("text — The Agentic AI Bible...") is noise
         // that the model has to read past on every line. Keep genuine titles, drop roles.
-        String title = row.title() == null ? "" : row.title().strip();
+        String title = normalizeWhitespace(row.title());
         boolean titleIsUseful =
                 !title.isBlank() && !UI_ROLE_TITLES.contains(title.toLowerCase(java.util.Locale.ROOT));
-        String body = row.body() == null ? "" : row.body().strip();
+        String body = normalizeWhitespace(row.body());
 
         if (titleIsUseful) {
             line.append(title);
@@ -285,6 +285,28 @@ public class DefaultEpisodeGrouper implements EpisodeGrouper {
             line.append(body);
         }
         return line.toString();
+    }
+
+    /**
+     * Collapses the whitespace runs the accessibility tree leaves in captured text.
+     *
+     * <p>Screen layout arrives as literal spacing, so a real captured email reached the graph as
+     * {@code "I am keen to<47 spaces>buy this one"}. That is not cosmetic: those runs are
+     * tokens the extraction model pays for and reads through, and two captures of the same text
+     * with different padding look like different lines to the deduplication above, so the
+     * repetition survives.
+     *
+     * <p>Line structure is preserved — paragraph breaks in an email carry meaning — while runs
+     * of spaces and tabs within a line collapse to one and blank lines are dropped.
+     */
+    private String normalizeWhitespace(String value) {
+        if (value == null || value.isBlank()) {
+            return "";
+        }
+        return value.lines()
+                .map(line -> line.replaceAll("[\\p{Zs}\\t\\x0B\\f\\r]+", " ").strip())
+                .filter(line -> !line.isEmpty())
+                .collect(Collectors.joining("\n"));
     }
 
     /** Exposed for the ingest service's provenance logging. */

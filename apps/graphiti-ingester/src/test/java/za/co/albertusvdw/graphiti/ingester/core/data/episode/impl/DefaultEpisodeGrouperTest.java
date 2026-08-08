@@ -139,6 +139,40 @@ class DefaultEpisodeGrouperTest {
     }
 
     @Test
+    @DisplayName("layout whitespace from the accessibility tree is collapsed")
+    void collapsesWhitespaceRuns() {
+        // Verbatim shape of a real captured email that reached the graph with the run intact.
+        ExportRecord row = record(
+                1, SemanticKind.DOCUMENT, "mail", "d1", null, null,
+                "Hi there, \nI am keen to                              buy this one: link");
+
+        String body = grouper.group(List.of(row)).getFirst().body();
+
+        assertThat(body).isEqualTo("Hi there,\nI am keen to buy this one: link");
+    }
+
+    @Test
+    @DisplayName("the same text padded differently deduplicates to one line")
+    void deduplicatesAcrossDifferentPadding() {
+        // Without normalisation these are distinct strings and both survive, so the
+        // repetition the deduplication exists to remove comes straight back.
+        List<ExportRecord> rows = List.of(
+                record(1, SemanticKind.DOCUMENT, "doc", "d1", null, null, "total   due   now"),
+                record(2, SemanticKind.DOCUMENT, "doc", "d2", null, null, "total due     now"));
+
+        assertThat(grouper.group(rows).getFirst().body()).isEqualTo("total due now");
+    }
+
+    @Test
+    @DisplayName("paragraph structure survives — only runs within a line collapse")
+    void keepsLineStructure() {
+        ExportRecord row = record(
+                1, SemanticKind.DOCUMENT, "doc", "d1", null, null, "first  line\n\n\nsecond   line");
+
+        assertThat(grouper.group(List.of(row)).getFirst().body()).isEqualTo("first line\nsecond line");
+    }
+
+    @Test
     @DisplayName("an oversized episode is truncated and says so")
     void truncatesOversizedBodies() {
         String longBody = "x".repeat(500);
