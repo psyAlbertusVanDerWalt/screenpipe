@@ -120,6 +120,19 @@ public class DefaultIngestService implements IngestService {
         String groupId = ingestProperties.getGroupId();
         IngestedEpisode ledgerRow = ledger.claim(episode, groupId);
 
+        // Already sent on an earlier run? Check whether it has since landed before sending it
+        // again. Extraction routinely finishes after the verify budget expires, and re-posting
+        // an episode that did land duplicates it in the graph — which is exactly what happened
+        // before this check existed: the same content appeared under several names, one copy
+        // per run, and no amount of retrying would ever converge.
+        if (ledgerRow.getPostedAt() != null && graphitiProperties.isVerifyAfterPost()) {
+            if (isAlreadyInGraph(episode, groupId)) {
+                log.info("episode '{}' had landed after all — marking verified, not re-posting", episode.name());
+                ledger.markVerified(ledgerRow.getId());
+                return IngestStatus.VERIFIED;
+            }
+        }
+
         if (ledgerRow.getAttempts() > graphitiProperties.getMaxAttempts()) {
             log.warn(
                     "episode '{}' exhausted its {} attempt(s), parking as failed",
@@ -155,10 +168,18 @@ public class DefaultIngestService implements IngestService {
             return IngestStatus.VERIFIED;
         }
 
+        // Deliberately does not assert a silent drop. Absence at this point means only that it
+        // had not appeared within the budget — it may still be extracting. The next run checks
+        // before re-posting, so a late arrival is picked up rather than duplicated.
+        long budgetSeconds =
+                graphitiProperties.getVerifyDelay().toSeconds() * graphitiProperties.getVerifyAttempts();
         log.warn(
-                "episode '{}' was accepted but never appeared in the graph — silent drop (see fork issue #20)",
-                episode.name());
-        ledger.markFailed(ledgerRow.getId(), IngestStatus.DROPPED, "accepted but absent from the graph");
+                "episode '{}' not confirmed within {}s — still extracting, or silently dropped (fork issue #20)."
+                        + " The next run re-checks before re-posting.",
+                episode.name(),
+                budgetSeconds);
+        ledger.markFailed(
+                ledgerRow.getId(), IngestStatus.DROPPED, "not confirmed within " + budgetSeconds + "s");
         return IngestStatus.DROPPED;
     }
 
@@ -188,6 +209,18 @@ public class DefaultIngestService implements IngestService {
             }
         }
         throw last;
+    }
+
+    /** Single immediate presence check, with no waiting — used before deciding to re-post. */
+    private boolean isAlreadyInGraph(Episode episode, String groupId) {
+        try {
+            return graphitiClient.episodeNames(groupId, VERIFY_WINDOW).contains(episode.name());
+        } catch (GraphitiException exception) {
+            // Unknown, not absent. Fall through to posting: a duplicate is recoverable, a
+            // permanently missing episode is not.
+            log.debug("presence check failed, will post: {}", exception.getMessage());
+            return false;
+        }
     }
 
     /**

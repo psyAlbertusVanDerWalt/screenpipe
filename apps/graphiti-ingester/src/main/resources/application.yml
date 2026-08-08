@@ -47,8 +47,10 @@ graphiti:
   initial-backoff: 5s
   max-backoff: 2m
   verify-after-post: ${GRAPHITI_VERIFY_AFTER_POST:true}
-  verify-delay: 20s
-  verify-attempts: 3
+  # 10 x 30s = 5 minutes. Extraction has been measured from 18s to over 180s; a shorter
+  # budget declares successful episodes dropped.
+  verify-delay: 30s
+  verify-attempts: 10
 
 management:
   endpoints:

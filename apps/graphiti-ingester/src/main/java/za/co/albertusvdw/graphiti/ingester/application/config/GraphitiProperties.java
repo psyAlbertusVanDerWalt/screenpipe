@@ -67,11 +67,20 @@ public class GraphitiProperties {
      * <p>{@code add_memory} returns as soon as the episode is queued, not once it is
      * processed, so an immediate check would report a false absence for every episode.
      */
-    private Duration verifyDelay = Duration.ofSeconds(20);
+    private Duration verifyDelay = Duration.ofSeconds(30);
 
-    /** How many times to re-check for a posted episode before treating it as dropped. */
+    /**
+     * How many times to re-check for a posted episode before treating it as dropped.
+     *
+     * <p>Together with {@link #verifyDelay} this is the total budget, and it must exceed how
+     * long extraction actually takes or every episode is declared dropped while succeeding.
+     * That is not hypothetical: at 3 attempts x 20s the budget was 60s, and a measured episode
+     * landed in the graph 27 seconds after the ingester had already given up on it and logged
+     * a silent drop. Extraction has been measured between 18s and over 180s, so the budget is
+     * now 10 x 30s = 5 minutes.
+     */
     @Min(1)
-    private int verifyAttempts = 3;
+    private int verifyAttempts = 10;
 
     /**
      * Whether to verify at all.
