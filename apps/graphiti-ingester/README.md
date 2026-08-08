@@ -35,6 +35,18 @@ deterministic code, so no model is spent deciding what belongs together.
 out-of-enum types under load; one measured run against a large cloud model produced roughly
 ten types that were never in the ontology.
 
+**Episode names come from the window, not the title.** On non-message rows the `title` field
+carries the accessibility element's *role*. Over a real day every distinct non-message title
+was one of `text` (31), `button` (3), `edit` (2), `Default` (2) — so naming from it produced
+episodes called "text" and "button". The window title is what describes the activity
+("Inbox (109) - Gmail", "Email - Outlook"), with the trailing app segment trimmed.
+
+**Bodies are deduplicated across the whole episode.** The same on-screen element is
+re-captured every frame: measured 31 rows collapsing to 2 distinct lines, and a terminal
+episode that was the words "Command Prompt" repeated 32 times. Beyond wasting extraction
+tokens, that repetition padded contentless episodes past the minimum-length filter meant to
+drop them.
+
 **Verify after posting.** `add_memory` returns as soon as an episode is *queued*, not when
 it is processed. A live 10-episode test against this deployment measured a **40% silent-drop
 rate** — the extraction model returns a null where Graphiti's schema requires a string, the
@@ -42,6 +54,14 @@ background queue logs it, and the episode never appears, while the caller sees a
 normal response. Every post is therefore confirmed by looking the episode up again, and
 episodes that vanish are recorded as `DROPPED` rather than counted as success. See
 [issue #20](https://github.com/psyAlbertusVanDerWalt/screenpipe/issues/20).
+
+**The verify budget must exceed extraction time**, or the service declares its own successes
+dropped. At 3 × 20s it reported a 100% drop rate while an episode landed in the graph 27
+seconds after it had given up. Extraction measures between 18s and over 180s, so the budget
+is 10 × 30s. And because `DROPPED` is non-terminal, a re-run used to re-post episodes that had
+actually landed — adding a duplicate copy each time, so retrying created the very thing it
+was retrying for. An already-posted episode is now checked for presence before being sent
+again.
 
 **The ledger is the cursor.** `ingested_episode` holds one row per episode ever attempted,
 keyed on a deterministic `episode_key`. A re-run of an already-processed file is a no-op, and
