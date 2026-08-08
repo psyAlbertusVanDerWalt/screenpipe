@@ -131,6 +131,25 @@ Secrets:
 | `COOLIFY_API_TOKEN` | Coolify → Keys & Tokens → API tokens. **Deploy** permission is enough. |
 | `COOLIFY_APP_UUID` | from the app's URL in the Coolify dashboard |
 
+### Deployed identifiers
+
+Live as of 2026-08-08, in Coolify project `screenpipe` / environment `production`:
+
+| Resource | UUID | Notes |
+|---|---|---|
+| Application | `k98clse3y97ecglnqtnhrhdq` | `fqdn: null` — LAN-only, deliberately |
+| PostgreSQL 16 | `y2dnm3lqljc14ivy1wyrz0s6` | the uuid is also its internal hostname |
+| Volume | `uu97nyp54377a28ev1m0bhkk` | `/data/redacted-jsonl` |
+| Pull task | `hwlqr5zil6droewmjhvxii51` | `0 9,14 * * 1-5` |
+
+Creating the app via the API auto-assigns a public `*.sslip.io` FQDN, which would have put
+the unauthenticated ingest trigger on the internet. Clearing it with an `fqdn: ""` update
+works — worth noting because fork issue #12 records an FQDN as unremovable, but that applies
+to *service sub-apps*, not applications.
+
+Coolify's bulk env update writes each variable into both the production and preview scopes.
+This app has no preview deployments, so the preview copies are inert.
+
 ### Coolify application setup
 
 1. **Type**: Docker Image
@@ -223,10 +242,14 @@ Then a scheduled task on the app:
 |---|---|
 | Command | `/usr/local/bin/pull-export.sh` |
 | Frequency | `0 9,14 * * 1-5` |
-| Container | the ingester container |
+| Container | `graphiti-ingester` |
 
 The command is a script in the image, not inline, because Coolify stores that field in a
 `varchar(255)` and rejects anything longer with a bodyless HTTP 500.
+
+**Container is mandatory.** Coolify's create-task API happily accepts a task with
+`container: null` and returns success, but the task then has nothing to exec into and never
+runs. Nothing surfaces this — the task simply sits there looking configured.
 
 Schedule it an hour *before* the ingest cron (`0 10,15 * * MON-FRI`) so each ingest works on
 freshly pulled data, and keep both inside working hours — the workstation is asleep otherwise.
@@ -268,6 +291,15 @@ installed yet:
   instead of hanging on a prompt inside a cron job
 - Files land in the shared volume owned by `appuser`, and the ingester in a separate
   container reads them on its next run — the volume handoff works across both
+
+### Verified in production
+
+- The full pipeline ran green: test → build → push to `registry.albertusvdw.co.za` → Coolify
+  deploy webhook
+- The app is `running:healthy` with `fqdn: null` — Flyway applied `V1` against the real
+  Postgres and the readiness probe passes
+- The scheduled task exec's into the container and runs `pull-export.sh`, which reports the
+  one genuinely missing piece: `no private key at /keys/id_ed25519`
 
 ## Still to do
 
