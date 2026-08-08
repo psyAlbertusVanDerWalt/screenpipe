@@ -23,6 +23,10 @@ spring:
 ingest:
   export-dir: ${INGEST_EXPORT_DIR:/data/redacted-jsonl}
   group-id: ${INGEST_GROUP_ID:screenpipe}
+  # Shared secret for the workstation's push. Blank disables the upload endpoint rather
+  # than leaving it open — it writes files that become graph content.
+  upload-token: ${INGEST_UPLOAD_TOKEN:}
+  max-upload-bytes: 67108864
   day-boundary-zone: ${INGEST_DAY_BOUNDARY_ZONE:Africa/Johannesburg}
   max-episode-body-chars: 12000
   min-episode-body-chars: 40

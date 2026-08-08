@@ -44,6 +44,19 @@ public class IngestProperties {
     @Min(0)
     private int minEpisodeBodyChars = 40;
 
+    /**
+     * Shared secret the workstation presents when pushing an export file.
+     *
+     * <p>Blank disables the upload endpoint entirely rather than leaving it open. Failing
+     * closed matters more than convenience here: the endpoint writes files that later become
+     * graph content, so an unauthenticated one is a content-injection route.
+     */
+    private String uploadToken = "";
+
+    /** Ceiling on a single uploaded file. A day's real export is a few hundred KB. */
+    @Min(1024)
+    private long maxUploadBytes = 64L * 1024 * 1024;
+
     private Schedule schedule = new Schedule();
 
     @Getter
