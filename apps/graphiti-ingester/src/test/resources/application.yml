@@ -1,0 +1,25 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:graphiti-ingester;DB_CLOSE_DELAY=-1;MODE=PostgreSQL
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+  flyway:
+    enabled: false
+
+ingest:
+  export-dir: target/test-exports
+  group-id: test-group
+  day-boundary-zone: Africa/Johannesburg
+  schedule:
+    enabled: false
+
+graphiti:
+  mcp-url: http://localhost:1/mcp/
+  verify-after-post: false
+  initial-backoff: 1ms
+  max-backoff: 1ms
+  verify-delay: 1ms
