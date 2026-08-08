@@ -6,9 +6,11 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -40,6 +42,21 @@ import za.co.albertusvdw.graphiti.ingester.core.data.export.SemanticKind;
 public class DefaultEpisodeGrouper implements EpisodeGrouper {
 
     private static final String ORPHAN_PARENT_KEY_PREFIX = "orphan";
+
+    /**
+     * Accessibility role names that arrive in the {@code title} field.
+     *
+     * <p>Non-message rows carry the a11y element's role, not a document title. Measured over a
+     * real day's export, every distinct non-message title was one of these: {@code text} (31),
+     * {@code button} (3), {@code edit} (2), {@code Default} (2). Naming episodes from that
+     * field produced episodes called "text" and "button", which say nothing about what
+     * happened and give the extraction model nothing to anchor on.
+     */
+    private static final Set<String> UI_ROLE_TITLES = Set.of(
+            "text", "edit", "button", "default", "list", "listitem", "document", "pane", "group",
+            "combobox", "checkbox", "radiobutton", "link", "image", "menu", "menuitem", "menubar",
+            "toolbar", "tab", "tabitem", "tree", "treeitem", "table", "cell", "row", "heading",
+            "static", "statictext", "generic", "none", "window", "dialog", "scrollbar", "separator");
 
     private final IngestProperties properties;
     private final ZoneId dayBoundaryZone;
@@ -164,14 +181,49 @@ public class DefaultEpisodeGrouper implements EpisodeGrouper {
                 .toList();
     }
 
+    /**
+     * Names the episode after the window it happened in, not the a11y role of some element.
+     *
+     * <p>Window titles are what actually describe the activity — "Inbox (108) - Gmail - Google
+     * Chrome", "Email - Outlook", "[CHANNEL] | Hydration Nation 4.0 - Discord". The title field
+     * is preferred only when it is a real title rather than one of {@link #UI_ROLE_TITLES}.
+     */
     private String nameFor(ExportRecord anchor) {
-        if (anchor.title() != null && !anchor.title().isBlank()) {
-            return anchor.title().strip();
+        String window = cleanWindowName(anchor);
+        if (!window.isBlank()) {
+            return window;
         }
-        if (!anchor.windowName().isBlank()) {
-            return anchor.windowName().strip();
+        String title = anchor.title() == null ? "" : anchor.title().strip();
+        if (!title.isBlank() && !UI_ROLE_TITLES.contains(title.toLowerCase(java.util.Locale.ROOT))) {
+            return title;
         }
         return anchor.appName();
+    }
+
+    /**
+     * Trims the trailing application segment from a window title.
+     *
+     * <p>"Inbox (108) - ... - Gmail - Google Chrome" becomes "Inbox (108) - ... - Gmail": the
+     * browser's name is already implied by the app and repeating it in every episode name makes
+     * a list of them harder to scan, not easier.
+     */
+    private String cleanWindowName(ExportRecord anchor) {
+        String window = anchor.windowName() == null ? "" : anchor.windowName().strip();
+        if (window.isBlank()) {
+            return "";
+        }
+        int lastSeparator = window.lastIndexOf(" - ");
+        if (lastSeparator > 0) {
+            String tail = window.substring(lastSeparator + 3).strip();
+            String app = anchor.appName().replaceFirst("(?i)\\.exe$", "").strip();
+            // "Google Chrome" vs "chrome.exe", "Discord" vs "Discord.exe" — compare loosely.
+            String normalisedTail = tail.replaceAll("\\s+", "").toLowerCase(java.util.Locale.ROOT);
+            String normalisedApp = app.replaceAll("\\s+", "").toLowerCase(java.util.Locale.ROOT);
+            if (normalisedTail.endsWith(normalisedApp) || normalisedApp.endsWith(normalisedTail)) {
+                return window.substring(0, lastSeparator).strip();
+            }
+        }
+        return window;
     }
 
     /**
@@ -186,9 +238,19 @@ public class DefaultEpisodeGrouper implements EpisodeGrouper {
         StringBuilder builder = new StringBuilder();
         int limit = properties.getMaxEpisodeBodyChars();
 
+        // Deduplicated across the whole episode, not just adjacent lines.
+        //
+        // The same on-screen element is re-captured on every frame, so a single window produces
+        // the identical line dozens of times: measured 31 rows collapsing to 2 distinct lines,
+        // and a terminal episode that was the words "Command Prompt" repeated 32 times. Sending
+        // that to the extraction model costs tokens to describe nothing, and an episode padded
+        // with repetition also sails past the min-length filter that is supposed to drop
+        // contentless activity.
+        Set<String> seen = new LinkedHashSet<>();
+
         for (ExportRecord row : rows) {
             String line = renderRow(row);
-            if (line.isBlank()) {
+            if (line.isBlank() || !seen.add(line)) {
                 continue;
             }
             if (builder.length() + line.length() > limit) {
@@ -205,14 +267,22 @@ public class DefaultEpisodeGrouper implements EpisodeGrouper {
         if (row.actorToken() != null && !row.actorToken().isBlank()) {
             line.append(row.actorToken()).append(": ");
         }
-        if (row.title() != null && !row.title().isBlank()) {
-            line.append(row.title().strip());
-            if (row.body() != null && !row.body().isBlank()) {
+
+        // A role name prefixed onto real content ("text — The Agentic AI Bible...") is noise
+        // that the model has to read past on every line. Keep genuine titles, drop roles.
+        String title = row.title() == null ? "" : row.title().strip();
+        boolean titleIsUseful =
+                !title.isBlank() && !UI_ROLE_TITLES.contains(title.toLowerCase(java.util.Locale.ROOT));
+        String body = row.body() == null ? "" : row.body().strip();
+
+        if (titleIsUseful) {
+            line.append(title);
+            if (!body.isBlank()) {
                 line.append(" — ");
             }
         }
-        if (row.body() != null && !row.body().isBlank()) {
-            line.append(row.body().strip());
+        if (!body.isBlank()) {
+            line.append(body);
         }
         return line.toString();
     }

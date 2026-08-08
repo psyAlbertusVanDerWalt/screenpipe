@@ -90,6 +90,55 @@ class DefaultEpisodeGrouperTest {
     }
 
     @Test
+    @DisplayName("the same on-screen element re-captured across frames appears once")
+    void deduplicatesRepeatedLines() {
+        // Real shape: a terminal window captured on 32 consecutive frames, identical every time.
+        List<ExportRecord> rows = new java.util.ArrayList<>();
+        for (int frame = 1; frame <= 32; frame++) {
+            rows.add(record(frame, SemanticKind.DOCUMENT, "term", "d" + frame, null, "Command Prompt", null));
+        }
+
+        List<Episode> episodes = grouper.group(rows);
+
+        assertThat(episodes).hasSize(1);
+        assertThat(episodes.getFirst().body()).isEqualTo("Command Prompt");
+        assertThat(episodes.getFirst().frameIds()).hasSize(32);
+    }
+
+    @Test
+    @DisplayName("episodes are named after the window, not the accessibility role")
+    void namesFromTheWindowNotTheRole() {
+        ExportRecord row = recordWithWindow(
+                1, SemanticKind.DOCUMENT, "mail", "d1", "text", "an email body",
+                "chrome.exe", "Inbox (108) - Gmail - Google Chrome");
+
+        List<Episode> episodes = grouper.group(List.of(row));
+
+        // Not "text", and the trailing browser name is dropped as redundant with the app.
+        assertThat(episodes.getFirst().name()).isEqualTo("Inbox (108) - Gmail");
+    }
+
+    @Test
+    @DisplayName("a genuine title is kept when it is not a role name")
+    void keepsRealTitles() {
+        ExportRecord row = recordWithWindow(
+                1, SemanticKind.DOCUMENT, "doc", "d1", "Q3 architecture review", "body text",
+                "WINWORD.EXE", "");
+
+        assertThat(grouper.group(List.of(row)).getFirst().name()).isEqualTo("Q3 architecture review");
+    }
+
+    @Test
+    @DisplayName("a role name is not prefixed onto real content in the body")
+    void dropsRoleNamesFromRenderedLines() {
+        ExportRecord row = recordWithWindow(
+                1, SemanticKind.DOCUMENT, "doc", "d1", "text", "The Agentic AI Bible",
+                "chrome.exe", "Reader - Google Chrome");
+
+        assertThat(grouper.group(List.of(row)).getFirst().body()).isEqualTo("The Agentic AI Bible");
+    }
+
+    @Test
     @DisplayName("an oversized episode is truncated and says so")
     void truncatesOversizedBodies() {
         String longBody = "x".repeat(500);
@@ -98,6 +147,36 @@ class DefaultEpisodeGrouperTest {
         List<Episode> episodes = grouper.group(List.of(huge));
 
         assertThat(episodes.getFirst().body()).contains("[truncated at 200 characters]");
+    }
+
+    private ExportRecord recordWithWindow(
+            long frameId,
+            SemanticKind kind,
+            String itemKey,
+            String localId,
+            String title,
+            String body,
+            String appName,
+            String windowName) {
+        return new ExportRecord(
+                ExportRecord.SUPPORTED_SCHEMA_VERSION,
+                frameId,
+                Instant.parse("2026-08-07T09:00:00Z"),
+                "2026-08-07T09:00:00Z",
+                "second",
+                kind,
+                itemKey,
+                localId,
+                null,
+                IdentityQuality.STABLE,
+                title,
+                body,
+                null,
+                null,
+                appName,
+                windowName,
+                null,
+                Map.of());
     }
 
     private ExportRecord record(
@@ -124,7 +203,8 @@ class DefaultEpisodeGrouperTest {
                 null,
                 null,
                 "Teams",
-                "Standup — Teams",
+                // Real Windows titles use " - " as the separator; the app suffix is trimmed.
+                "Standup - Teams",
                 null,
                 Map.of());
     }
