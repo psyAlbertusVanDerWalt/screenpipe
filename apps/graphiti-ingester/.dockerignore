@@ -1,0 +1,13 @@
+# Build output — the image builds its own; copying a host-built target/ in would mask a
+# broken build with a stale jar.
+target/
+
+# Local tooling and IDE state
+.idea/
+*.iml
+.vscode/
+
+# Docs and CI config are not needed inside the image
+README.md
+Dockerfile
+.dockerignore

@@ -92,6 +92,95 @@ burns its whole attempt budget on connection failures.
 | `GET` | `/api/v1/ingest/report` | Ledger totals, including the observed drop rate. |
 | `GET` | `/actuator/health` | Liveness/readiness. |
 
+## Deployment
+
+Push to `main` → GitHub Actions runs the tests, builds the image, pushes it to the
+self-hosted registry, then calls Coolify's deploy webhook.
+Workflow: [`.github/workflows/deploy-graphiti-ingester.yml`](../../.github/workflows/deploy-graphiti-ingester.yml).
+
+The workflow is **path-filtered** to `apps/graphiti-ingester/**`. This is a Java service
+inside a Rust/Tauri monorepo, so without the filter every unrelated screenpipe commit would
+rebuild and redeploy it. Use the *Run workflow* button to force a build.
+
+### Local image build
+
+```bash
+cd apps/graphiti-ingester
+docker build -t graphiti-ingester:local .
+```
+
+Maven comes from the `maven:3.9-eclipse-temurin-21` base image rather than `./mvnw`. The
+wrapper is kept for local CLI use, but in the image it only adds a Maven download plus an
+`unzip` dependency the JRE image doesn't ship, for no reproducibility gain over a pinned tag.
+
+### Required GitHub configuration
+
+Variables (Settings → Secrets and variables → Actions → Variables):
+
+| Name | Example |
+|---|---|
+| `REGISTRY_URL` | `registry.albertusvdw.co.za` (no scheme, no trailing slash) |
+| `REGISTRY_USERNAME` | registry user |
+| `COOLIFY_URL` | `https://coolify.albertusvdw.co.za` (no trailing slash) |
+
+Secrets:
+
+| Name | Notes |
+|---|---|
+| `REGISTRY_PASSWORD` | registry password |
+| `COOLIFY_API_TOKEN` | Coolify → Keys & Tokens → API tokens. **Deploy** permission is enough. |
+| `COOLIFY_APP_UUID` | from the app's URL in the Coolify dashboard |
+
+### Coolify application setup
+
+1. **Type**: Docker Image
+2. **Image**: `registry.albertusvdw.co.za/graphiti-ingester` — no `:latest`, Coolify appends
+   the tag itself
+3. **Exposed port**: `8080`. Must match the container exactly; a wrong value here resolves
+   but fails every request silently.
+4. **Port mappings**: leave empty — Traefik routes over the Docker network
+5. **No public FQDN.** This service has no reason to be reachable from the internet: its only
+   HTTP surface is a maintenance trigger and a stats endpoint, both unauthenticated. Keep it
+   LAN-internal, consistent with graphiti-mcp itself. Note that Coolify 4.1.2 cannot actually
+   remove an auto-assigned FQDN once created (fork issue #12), so avoid creating one rather
+   than planning to delete it.
+6. **Volume**: mount the pulled export at `/data/redacted-jsonl`, matching where #16 lands it.
+7. Create the PostgreSQL 16 database **in the same Coolify project** so the two share a
+   network and can talk by internal hostname.
+
+Coolify hands out a `postgres://user:pass@host:5432/db` connection string. JDBC needs a
+different scheme — convert it by hand:
+
+```
+# Coolify gives you
+postgres://graphiti:PASSWORD@internal-hostname:5432/graphiti_ingester
+
+# set as
+DATASOURCE_URL=jdbc:postgresql://internal-hostname:5432/graphiti_ingester
+DATASOURCE_USERNAME=graphiti
+DATASOURCE_PASSWORD=PASSWORD
+```
+
+Never point it at `localhost` — inside a container that resolves to the container itself.
+`SPRING_DATASOURCE_URL` also works via relaxed binding if you prefer the Spring-native name.
+
+Schema is managed by Flyway, not Liquibase, and `V1__create_ingested_episode.sql` builds
+everything from scratch, so a fresh database needs no special handling. `ddl-auto` is
+`validate`, so a drift between the entity and the migration fails at startup rather than
+silently reshaping the table.
+
+## Verified
+
+Against a real export on the workstation, in the built container talking to a real Postgres:
+
+- Image builds; runs as non-root (`uid=1001 appuser`); healthcheck reports healthy
+- Flyway applies `V1`, both indexes created, `ddl-auto: validate` passes
+- `2026-08-07.jsonl` → 253 rows → **5 episodes**, no orphans, no key collisions
+- With graphiti-mcp unreachable, all 5 fail cleanly and are recorded as `FAILED` — the run
+  itself still completes
+- Re-running retries the same 5 and increments `attempts` rather than creating duplicates,
+  confirming the episode key is genuinely stable
+
 ## Still to do
 
 - Extraction-result validation is specified and the ontology enums are in place, but the
@@ -99,6 +188,7 @@ burns its whole attempt budget on connection failures.
   entity/edge check has no local extraction output to run against yet. Wire it in when
   extraction moves client-side, or use it to audit what came back.
 - Dangling-edge rejection, same reason.
-- Dockerfile and the CI-to-Coolify pipeline.
+- Never yet run against the **live** graphiti-mcp endpoint — every test so far deliberately
+  pointed at a dead port to avoid writing into the real graph.
 - Depends on [#16](https://github.com/psyAlbertusVanDerWalt/screenpipe/issues/16) for real
   data to land in `INGEST_EXPORT_DIR`.

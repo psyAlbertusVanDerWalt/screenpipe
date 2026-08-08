@@ -164,6 +164,15 @@ public class McpGraphitiClient implements GraphitiClient {
         return unwrapResult(response, method);
     }
 
+    /**
+     * Establishes the MCP session, translating every transport failure into a
+     * {@link GraphitiException}.
+     *
+     * <p>The translation is the point. {@code RestClient} throws {@code ResourceAccessException}
+     * when the endpoint is unreachable, and callers up the stack catch only
+     * {@code GraphitiException} — so an unwrapped one escapes the per-episode handler and aborts
+     * the entire batch, which is exactly the failure mode this service is supposed to survive.
+     */
     private synchronized void ensureSession() {
         if (sessionId.get() != null) {
             return;
@@ -173,31 +182,43 @@ public class McpGraphitiClient implements GraphitiClient {
                 "capabilities", Map.of(),
                 "clientInfo", Map.of("name", "graphiti-ingester", "version", "0.1.0"));
 
-        var response = restClient
-                .post()
-                .contentType(MediaType.APPLICATION_JSON)
-                .accept(MediaType.APPLICATION_JSON, EVENT_STREAM)
-                .body(buildRequest("initialize", params))
-                .retrieve()
-                .toEntity(String.class);
+        String issued;
+        try {
+            var response = restClient
+                    .post()
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .accept(MediaType.APPLICATION_JSON, EVENT_STREAM)
+                    .body(buildRequest("initialize", params))
+                    .retrieve()
+                    .toEntity(String.class);
 
-        String issued = response.getHeaders().getFirst(SESSION_HEADER);
+            issued = response.getHeaders().getFirst(SESSION_HEADER);
+        } catch (RestClientException exception) {
+            throw new GraphitiException(
+                    "MCP initialize failed: " + exception.getMessage(), exception, true);
+        }
+
         if (issued == null || issued.isBlank()) {
             throw new GraphitiException("MCP initialize returned no " + SESSION_HEADER, true);
         }
+
+        try {
+            // The spec requires this notification before any tool call; the server rejects
+            // tools/call on a session that never completed the handshake.
+            restClient
+                    .post()
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .accept(MediaType.APPLICATION_JSON, EVENT_STREAM)
+                    .header(SESSION_HEADER, issued)
+                    .body(Map.of("jsonrpc", "2.0", "method", "notifications/initialized"))
+                    .retrieve()
+                    .toBodilessEntity();
+        } catch (RestClientException exception) {
+            throw new GraphitiException(
+                    "MCP initialized notification failed: " + exception.getMessage(), exception, true);
+        }
+
         sessionId.set(issued);
-
-        // The spec requires this notification before any tool call; the server rejects
-        // tools/call on a session that never completed the handshake.
-        restClient
-                .post()
-                .contentType(MediaType.APPLICATION_JSON)
-                .accept(MediaType.APPLICATION_JSON, EVENT_STREAM)
-                .header(SESSION_HEADER, issued)
-                .body(Map.of("jsonrpc", "2.0", "method", "notifications/initialized"))
-                .retrieve()
-                .toBodilessEntity();
-
         log.debug("established MCP session {}", issued);
     }
 

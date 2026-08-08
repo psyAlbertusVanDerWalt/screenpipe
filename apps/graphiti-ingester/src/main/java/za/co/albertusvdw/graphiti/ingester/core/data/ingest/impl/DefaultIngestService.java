@@ -131,7 +131,14 @@ public class DefaultIngestService implements IngestService {
 
         try {
             postWithBackoff(episode, groupId);
-        } catch (GraphitiException exception) {
+        } catch (RuntimeException exception) {
+            // Deliberately catches RuntimeException, not just GraphitiException. One episode
+            // must never be able to abort the batch — #17 asks for resume-from-cursor
+            // behaviour, and an unwrapped transport exception escaping here would take every
+            // remaining episode down with it.
+            if (Thread.currentThread().isInterrupted()) {
+                throw exception;
+            }
             log.warn("episode '{}' failed to post: {}", episode.name(), exception.getMessage());
             // Left non-terminal so the next scheduled run retries it — a failure here is
             // usually the model or the workstation being unavailable, not bad data.
