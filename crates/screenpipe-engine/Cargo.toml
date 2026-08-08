@@ -30,6 +30,10 @@ screenpipe-vault = { path = "../screenpipe-vault" }
 screenpipe-secrets = { path = "../screenpipe-secrets" }
 screenpipe-semantic = { path = "../screenpipe-semantic" }
 screenpipe-sqlite-recovery = { path = "../screenpipe-sqlite-recovery" }
+# default-features off: the export pipeline only needs the local, unconditional
+# modules (cursor/destination/jsonl) — not the "http" (reqwest) or "encrypt"
+# (chacha20poly1305) features built for the cloud-sync path.
+screenpipe-sync = { path = "../screenpipe-sync", default-features = false }
 
 
 # Image processing
@@ -78,6 +82,9 @@ tokio-stream = { workspace = true, features = ["sync"] }
 
 # Directory management
 dirs = { workspace = true }
+
+# export.toml config for the redacted-export pipeline
+toml = { workspace = true }
 
 # Password input (no-echo for vault CLI)
 rpassword = "5"
@@ -191,6 +198,10 @@ jemalloc = ["tikv-jemallocator"]
 [[bin]]
 name = "screenpipe"
 path = "src/bin/screenpipe-engine.rs"
+
+[[bin]]
+name = "screenpipe-export"
+path = "src/bin/screenpipe-export.rs"
 
 [[bench]]
 name = "hot_frame_cache"

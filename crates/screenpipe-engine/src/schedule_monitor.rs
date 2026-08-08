@@ -110,6 +110,19 @@ fn parse_schedule_windows(rules: &[ScheduleRule]) -> Vec<ScheduleWindow> {
         .collect()
 }
 
+/// Check whether an arbitrary instant (not necessarily "now") falls within
+/// any configured schedule window.
+///
+/// Unlike [`schedule_paused`], which tracks live capture-pause state for the
+/// current moment, this answers the same question retroactively for a stored
+/// timestamp — e.g. "was this captured frame inside a work-hours window when
+/// it was captured?" `ScheduleRule.start_time`/`end_time` are local-time
+/// values, so `at` is converted to local before matching.
+pub fn matches_schedule_at(rules: &[ScheduleRule], at: chrono::DateTime<chrono::Utc>) -> bool {
+    let windows = parse_schedule_windows(rules);
+    is_within_schedule_windows(&windows, &at.with_timezone(&chrono::Local))
+}
+
 /// Returns the `record_mode` of the currently active schedule rule, if any.
 pub fn current_record_mode(rules: &[ScheduleRule]) -> Option<String> {
     let now = chrono::Local::now();
@@ -279,5 +292,35 @@ mod tests {
     fn global_flag_default_unpaused() {
         SCHEDULE_PAUSED.store(false, Ordering::SeqCst);
         assert!(!schedule_paused());
+    }
+
+    #[test]
+    fn matches_schedule_at_arbitrary_instant() {
+        // Monday 10:00 local, well inside the rule.
+        let inside = chrono::Local
+            .with_ymd_and_hms(2026, 3, 30, 10, 0, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let rules = vec![make_rule(0, "09:00", "17:00", "all")];
+        assert!(matches_schedule_at(&rules, inside));
+
+        // Monday 08:00 local, before the window opens.
+        let outside = chrono::Local
+            .with_ymd_and_hms(2026, 3, 30, 8, 0, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(!matches_schedule_at(&rules, outside));
+    }
+
+    #[test]
+    fn matches_schedule_at_ignores_current_wall_clock() {
+        // A historical instant far in the past should still match purely on
+        // its own day-of-week/time-of-day, independent of when the test runs.
+        let historical = chrono::Local
+            .with_ymd_and_hms(2020, 1, 6, 12, 0, 0) // a Monday
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let rules = vec![make_rule(0, "09:00", "17:00", "all")];
+        assert!(matches_schedule_at(&rules, historical));
     }
 }

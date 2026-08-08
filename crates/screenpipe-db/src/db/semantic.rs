@@ -448,6 +448,45 @@ impl DatabaseManager {
         }))
     }
 
+    /// Retrieve parsed frame contexts in ascending `frames.id` order, starting
+    /// just after `since_frame_id`. This is the cursor-friendly counterpart to
+    /// [`Self::search_semantic_context`] (which is newest-first and
+    /// relevance/time filtered) — built for callers that need to walk the
+    /// full history exactly once, incrementally, such as a local export job.
+    ///
+    /// Cursors on `frames.id` rather than `semantic_items.id` deliberately:
+    /// items are deduplicated and reused across runs by
+    /// [`Self::store_semantic_projection`], so `semantic_items.id` is not
+    /// monotonic per-occurrence, while `frames.id` is a stable, ordered
+    /// per-capture cursor and matches the unit `get_frame_semantic_context`
+    /// already operates on.
+    pub async fn get_semantic_items_since(
+        &self,
+        since_frame_id: i64,
+        limit: u32,
+    ) -> Result<Vec<SemanticFrameContext>, sqlx::Error> {
+        let frame_ids: Vec<i64> = sqlx::query_scalar(
+            r#"SELECT f.id
+                FROM frames f
+                JOIN semantic_runs sr ON sr.id = f.semantic_run_id
+                WHERE f.id > ?1 AND sr.status = 'handled'
+                ORDER BY f.id ASC
+                LIMIT ?2"#,
+        )
+        .bind(since_frame_id)
+        .bind(i64::from(limit.clamp(1, 1000)))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut contexts = Vec::with_capacity(frame_ids.len());
+        for frame_id in frame_ids {
+            if let Some(context) = self.get_frame_semantic_context(frame_id).await? {
+                contexts.push(context);
+            }
+        }
+        Ok(contexts)
+    }
+
     /// Retrieve compact semantic projections by frame, time, app, or FTS query.
     /// Results are newest-first and bounded before item bodies are materialized.
     pub async fn search_semantic_context(
