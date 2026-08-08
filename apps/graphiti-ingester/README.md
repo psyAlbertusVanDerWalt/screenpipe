@@ -169,6 +169,83 @@ everything from scratch, so a fresh database needs no special handling. `ddl-aut
 `validate`, so a drift between the entity and the migration fails at startup rather than
 silently reshaping the table.
 
+## The pull from the workstation (#16)
+
+The server pulls; the workstation does not push. A push has to fire at a moment the
+workstation is awake and the server is reachable, and misses its window entirely if either
+is false. A pull just collects whatever accumulated on the next run.
+
+```
+workstation                                  server
+  sshd (LAN only, key only)  <──── sftp ────  pull-export.sh   (Coolify scheduled task)
+  read-only on the export dir                      │
+                                                   ▼
+                                            /data/redacted-jsonl  (shared volume)
+                                                   │
+                                                   ▼
+                                             the ingester
+```
+
+### Workstation setup — needs one elevated run
+
+[`scripts/setup-workstation-ssh.ps1`](scripts/setup-workstation-ssh.ps1), from an elevated
+PowerShell. Idempotent. It installs OpenSSH Server and applies four independent controls:
+
+1. A dedicated `graphiti-pull` local account, in no group beyond Users
+2. NTFS ACLs giving it read-only access to the export directory **and nothing else** — this
+   is the control that actually bounds what can be read
+3. `ForceCommand internal-sftp` — no shell, no arbitrary commands, no forwarding
+4. A firewall rule allowing TCP/22 from the LAN subnet only, replacing the any-source rule
+   the OpenSSH feature installs by default
+
+Password auth is off globally, and `AllowUsers` limits login to that one account.
+
+It deliberately does **not** use `ChrootDirectory`. Win32-OpenSSH requires a chroot target
+owned by SYSTEM or Administrators and not writable by the chrooted user — untrue of a
+directory the export job writes as the logged-in user. Setting it anyway yields an sshd that
+refuses the session with an error that reads like a key problem. The ACLs already bound reads
+to the export directory; chroot would only hide the rest of the tree from listing.
+
+The script prints the host key fingerprints at the end. Pin one — do not trust first contact.
+
+### Server setup
+
+Two file storages on the Coolify app:
+
+| Mount path | Contents |
+|---|---|
+| `/keys/id_ed25519` | private half of the keypair generated on the workstation |
+| `/keys/known_hosts` | `ssh-keyscan -t ed25519 10.0.0.30`, checked against the printed fingerprint |
+
+Then a scheduled task on the app:
+
+| Field | Value |
+|---|---|
+| Command | `/usr/local/bin/pull-export.sh` |
+| Frequency | `0 9,14 * * 1-5` |
+| Container | the ingester container |
+
+The command is a script in the image, not inline, because Coolify stores that field in a
+`varchar(255)` and rejects anything longer with a bodyless HTTP 500.
+
+Schedule it an hour *before* the ingest cron (`0 10,15 * * MON-FRI`) so each ingest works on
+freshly pulled data, and keep both inside working hours — the workstation is asleep otherwise.
+
+Overrides: `PULL_SSH_HOST`, `PULL_SSH_PORT`, `PULL_SSH_USER`, `PULL_REMOTE_DIR`,
+`PULL_SSH_KEY`, `PULL_KNOWN_HOSTS`. `PULL_REMOTE_DIR` defaults to
+`/C:/Users/shortie/.screenpipe/export/redacted-jsonl` — Win32-OpenSSH's sftp server really
+does present drive letters that way.
+
+`rsync` is deliberately not used: it must be installed on both ends, and Windows OpenSSH has
+no rsync, so an rsync-based pull cannot work against this server however it is configured.
+
+### Retiring the old push
+
+`screenpipe-sync-sftp` (Coolify service `ljr8cr1uwjqb40ctmmpafjom`) and the disabled
+`screenpipe-sync-to-homeserver` scheduled task are the old push direction. Both are made
+redundant by this pull. The Windows task is already disabled; leave the service running until
+the first successful pull, then remove it.
+
 ## Verified
 
 Against a real export on the workstation, in the built container talking to a real Postgres:
@@ -181,6 +258,17 @@ Against a real export on the workstation, in the built container talking to a re
 - Re-running retries the same 5 and increments `attempts` rather than creating duplicates,
   confirming the episode key is genuinely stable
 
+The pull was verified against a stand-in SFTP server, since the workstation's sshd is not
+installed yet:
+
+- Key auth against a pinned host key transfers the files and exits 0
+- A **mismatched** host key is refused — the transfer fails and the script exits 1 rather
+  than trusting the new key
+- Missing key or missing `known_hosts` fails immediately with a message naming the fix,
+  instead of hanging on a prompt inside a cron job
+- Files land in the shared volume owned by `appuser`, and the ingester in a separate
+  container reads them on its next run — the volume handoff works across both
+
 ## Still to do
 
 - Extraction-result validation is specified and the ontology enums are in place, but the
@@ -190,5 +278,7 @@ Against a real export on the workstation, in the built container talking to a re
 - Dangling-edge rejection, same reason.
 - Never yet run against the **live** graphiti-mcp endpoint — every test so far deliberately
   pointed at a dead port to avoid writing into the real graph.
-- Depends on [#16](https://github.com/psyAlbertusVanDerWalt/screenpipe/issues/16) for real
-  data to land in `INGEST_EXPORT_DIR`.
+- The pull has never run against the **real** workstation. `sshd` is not installed there yet;
+  installing it needs an elevated run of `scripts/setup-workstation-ssh.ps1`. Until that
+  happens, `PULL_REMOTE_DIR`'s `/C:/...` path form and the ACL lockdown are both unverified
+  against Win32-OpenSSH.

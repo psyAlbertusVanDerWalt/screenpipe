@@ -28,8 +28,13 @@ FROM eclipse-temurin:21-jre-jammy AS runtime
 
 # curl is not in the temurin JRE image. Without it the HEALTHCHECK below fails every probe
 # and the container reports permanently unhealthy while the app is fine.
+#
+# openssh-client is here for the #16 pull: Coolify scheduled tasks exec inside an existing
+# container, and this is the one that already has the export volume mounted. rsync is
+# deliberately absent — it must exist on both ends, and Windows OpenSSH has no rsync, so an
+# rsync-based pull would fail against this particular server no matter how it is configured.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system --gid 1001 appuser \
@@ -38,10 +43,14 @@ RUN groupadd --system --gid 1001 appuser \
 WORKDIR /app
 
 COPY --from=builder /build/target/*.jar app.jar
+COPY scripts/pull-export.sh /usr/local/bin/pull-export.sh
 
-# The mount point for the redacted JSONL that #16 pulls down from the workstation. Owned by
-# appuser so the service can read it without running as root.
-RUN mkdir -p /data/redacted-jsonl && chown -R appuser:appuser /app /data
+# /keys holds the SSH private key and pinned known_hosts, mounted by Coolify as file storage.
+# The mount point for the redacted JSONL that #16 pulls down from the workstation. Both owned
+# by appuser so the service can read them without running as root.
+RUN chmod +x /usr/local/bin/pull-export.sh \
+    && mkdir -p /data/redacted-jsonl /keys \
+    && chown -R appuser:appuser /app /data /keys
 
 USER appuser
 
