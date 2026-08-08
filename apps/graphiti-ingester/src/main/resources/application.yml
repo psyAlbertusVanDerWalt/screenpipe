@@ -38,7 +38,10 @@ ingest:
     cron: ${INGEST_SCHEDULE_CRON:0 0 10,15 * * MON-FRI}
 
 graphiti:
-  mcp-url: ${GRAPHITI_MCP_URL:http://10.0.0.69:18000/mcp/}
+  mcp-url: ${GRAPHITI_MCP_URL:http://10.0.0.69:18000/mcp}
+  # Host graphiti-mcp's rebinding protection expects — its internal port, not the published
+  # one. Blank sends no override.
+  host-header: ${GRAPHITI_HOST_HEADER:localhost:8000}
   request-timeout: ${GRAPHITI_REQUEST_TIMEOUT:5m}
   max-attempts: 4
   initial-backoff: 5s

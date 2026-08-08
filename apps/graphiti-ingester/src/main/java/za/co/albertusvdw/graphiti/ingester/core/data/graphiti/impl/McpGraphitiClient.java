@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
@@ -184,10 +185,13 @@ public class McpGraphitiClient implements GraphitiClient {
 
         String issued;
         try {
-            var response = restClient
+            var request = restClient
                     .post()
                     .contentType(MediaType.APPLICATION_JSON)
-                    .accept(MediaType.APPLICATION_JSON, EVENT_STREAM)
+                    .accept(MediaType.APPLICATION_JSON, EVENT_STREAM);
+            applyHostHeader(request);
+
+            var response = request
                     .body(buildRequest("initialize", params))
                     .retrieve()
                     .toEntity(String.class);
@@ -205,12 +209,14 @@ public class McpGraphitiClient implements GraphitiClient {
         try {
             // The spec requires this notification before any tool call; the server rejects
             // tools/call on a session that never completed the handshake.
-            restClient
+            var notify = restClient
                     .post()
                     .contentType(MediaType.APPLICATION_JSON)
                     .accept(MediaType.APPLICATION_JSON, EVENT_STREAM)
-                    .header(SESSION_HEADER, issued)
-                    .body(Map.of("jsonrpc", "2.0", "method", "notifications/initialized"))
+                    .header(SESSION_HEADER, issued);
+            applyHostHeader(notify);
+
+            notify.body(Map.of("jsonrpc", "2.0", "method", "notifications/initialized"))
                     .retrieve()
                     .toBodilessEntity();
         } catch (RestClientException exception) {
@@ -220,6 +226,21 @@ public class McpGraphitiClient implements GraphitiClient {
 
         sessionId.set(issued);
         log.debug("established MCP session {}", issued);
+    }
+
+    /**
+     * Presents the Host header graphiti-mcp's rebinding protection expects.
+     *
+     * <p>Host is a restricted header in the JDK HTTP client and is silently ignored unless the
+     * JVM runs with {@code -Djdk.httpclient.allowRestrictedHeaders=host}, which the image sets.
+     * Without that flag this call is a no-op and every request comes back 421 — so the flag and
+     * this method have to travel together.
+     */
+    private void applyHostHeader(RestClient.RequestBodySpec request) {
+        String host = properties.getHostHeader();
+        if (host != null && !host.isBlank()) {
+            request.header(HttpHeaders.HOST, host);
+        }
     }
 
     private Map<String, Object> buildRequest(String method, Map<String, Object> params) {
@@ -239,6 +260,7 @@ public class McpGraphitiClient implements GraphitiClient {
             if (session != null) {
                 request = request.header(SESSION_HEADER, session);
             }
+            applyHostHeader(request);
             String raw = request.body(body).retrieve().body(String.class);
             return objectMapper.readTree(extractJsonPayload(raw));
         } catch (RestClientException exception) {

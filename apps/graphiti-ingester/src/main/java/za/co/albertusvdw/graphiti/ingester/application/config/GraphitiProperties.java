@@ -15,9 +15,32 @@ import org.springframework.validation.annotation.Validated;
 @ConfigurationProperties(prefix = "graphiti")
 public class GraphitiProperties {
 
-    /** Base MCP endpoint, e.g. {@code http://10.0.0.69:18000/mcp/}. LAN-only by design. */
+    /**
+     * MCP endpoint. LAN-only by design.
+     *
+     * <p>No trailing slash: {@code /mcp/} answers 307 to {@code /mcp}, and following that
+     * redirect makes the client recompute the Host header from the new URL — discarding the
+     * one set below and turning every call into a 421.
+     */
     @NotBlank
-    private String mcpUrl = "http://10.0.0.69:18000/mcp/";
+    private String mcpUrl = "http://10.0.0.69:18000/mcp";
+
+    /**
+     * Host header to present to graphiti-mcp.
+     *
+     * <p>The server runs FastMCP's DNS-rebinding protection, which validates Host against the
+     * address it believes it is served on — the container's internal {@code :8000}, not the
+     * published {@code :18000}. Connecting to the published port therefore sends
+     * {@code Host: 10.0.0.69:18000} and is rejected with
+     * {@code 421 Destination Locked: "Invalid Host header"}. Measured: {@code localhost:8000}
+     * and {@code 127.0.0.1:8000} are accepted, everything else is refused.
+     *
+     * <p>Overriding the header here rather than loosening the server's allowed hosts keeps the
+     * rebinding protection intact for every other client of that service. Blank sends no
+     * override, for the case where the ingester reaches graphiti-mcp over the Docker network
+     * on its real port.
+     */
+    private String hostHeader = "localhost:8000";
 
     /**
      * Per-request timeout.

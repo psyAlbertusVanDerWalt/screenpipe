@@ -52,7 +52,10 @@ EXPOSE 8080
 
 # MaxRAMPercentage rather than a fixed -Xmx: the container's memory limit is set in Coolify,
 # and a hardcoded heap would either waste it or get the process OOM-killed when it changes.
-ENV JAVA_OPTS="-XX:MaxRAMPercentage=75.0 -XX:+UseSerialGC"
+# allowRestrictedHeaders=host is required, not cosmetic: the JDK HTTP client silently drops a
+# Host header without it, and graphiti-mcp's DNS-rebinding protection then answers every
+# request with 421. See GraphitiProperties#hostHeader.
+ENV JAVA_OPTS="-XX:MaxRAMPercentage=75.0 -XX:+UseSerialGC -Djdk.httpclient.allowRestrictedHeaders=host"
 
 # Reports unhealthy while the ingest can't reach its database. Deliberately does not check
 # graphiti-mcp: the workstation behind it is expected to be asleep outside working hours, and
