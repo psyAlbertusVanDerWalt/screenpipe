@@ -125,6 +125,32 @@ $acl.SetAccessRule($rule)
 Set-Acl -Path $ExportDir -AclObject $acl
 Write-Ok "Granted $PullUser read-only on $ExportDir"
 
+# Grant alone is not enough to bound what this account can SEE.
+#
+# Measured on this workstation: the profile root carries an explicit
+# "Everyone: ReadAndExecute" ACE, which on a directory includes "list folder
+# contents". So graphiti-pull could enumerate every filename under C:\Users\<user>
+# — not read them, reads were denied, but the filenames alone describe projects,
+# clients and tooling. Files do not inherit that ACE, and .screenpipe itself does
+# not carry it, so captured data was never reachable.
+#
+# Denying this one account on the profile root closes the enumeration without
+# touching the Everyone ACE that other software may rely on. Windows evaluates
+# explicit ACEs before inherited ones, so the explicit Allow set on the export
+# directory above still wins there — which the script verifies at the end.
+$profileRoot = Split-Path -Parent (Split-Path -Parent $ExportDir)   # ...\.screenpipe
+$profileRoot = Split-Path -Parent $profileRoot                       # the user profile
+$denyAcl = Get-Acl $profileRoot
+$denyRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+    $PullUser,
+    'ReadAndExecute',
+    'ContainerInherit,ObjectInherit',
+    'None',
+    'Deny')
+$denyAcl.SetAccessRule($denyRule)
+Set-Acl -Path $profileRoot -AclObject $denyAcl
+Write-Ok "Denied $PullUser everything under $profileRoot except the export directory"
+
 # ---------------------------------------------------------------------------------------
 Write-Step "Installing the authorized key"
 
@@ -257,6 +283,27 @@ Get-ChildItem "$env:ProgramData\ssh\ssh_host_*_key.pub" | ForEach-Object {
     ssh-keygen -lf $_.FullName
 }
 
+# ---------------------------------------------------------------------------------------
+Write-Step "Verifying the lockdown"
+
+# Assert the boundary rather than assuming it. The Deny ACE above and the Allow on the
+# export directory interact through Windows' explicit-before-inherited precedence rule,
+# which is easy to get subtly wrong — so check the actual outcome.
+$exportAllowed = (Get-Acl $ExportDir).Access |
+    Where-Object { $_.IdentityReference -like "*$PullUser" -and $_.AccessControlType -eq 'Allow' }
+$profileDenied = (Get-Acl $profileRoot).Access |
+    Where-Object { $_.IdentityReference -like "*$PullUser" -and $_.AccessControlType -eq 'Deny' }
+
+if ($exportAllowed) { Write-Ok "export directory: Allow present" } else { Write-Warn "export directory: NO Allow ACE — the pull will fail" }
+if ($profileDenied) { Write-Ok "profile root: Deny present" } else { Write-Warn "profile root: NO Deny ACE — filenames remain enumerable" }
+
+# Resolved outside the here-string below: a $(...) subexpression inside a here-string is
+# real code, so escaping $_ inside it turns the scriptblock's first token into a command
+# name and PowerShell reports "'$_.IPAddress' is not recognized as the name of a cmdlet".
+$lanIp = (Get-NetIPAddress -AddressFamily IPv4 |
+    Where-Object { $_.IPAddress -like '10.*' } |
+    Select-Object -First 1).IPAddress
+
 Write-Host "`nDone." -ForegroundColor Green
 Write-Host @"
 
@@ -267,9 +314,12 @@ Next, on the server side:
   3. Enable the pull-export scheduled task.
 
 Verify from the server before relying on it:
-  sftp -i /keys/id_ed25519 $PullUser@$((Get-NetIPAddress -AddressFamily IPv4 |
-      Where-Object { `$_.IPAddress -like '10.*' } | Select-Object -First 1).IPAddress)
+  sftp -i /keys/id_ed25519 $PullUser@$lanIp
 
-Confirm the lockdown actually holds — this must FAIL:
-  sftp> get C:/Users/$env:USERNAME/Documents/anything
+Confirm the lockdown actually holds. This must list files:
+  sftp> ls /C:$($ExportDir.Substring(2) -replace '\\','/')
+
+And both of these must FAIL:
+  sftp> ls /C:/Users/$env:USERNAME
+  sftp> get /C:/Users/$env:USERNAME/ntuser.ini
 "@ -ForegroundColor Gray
