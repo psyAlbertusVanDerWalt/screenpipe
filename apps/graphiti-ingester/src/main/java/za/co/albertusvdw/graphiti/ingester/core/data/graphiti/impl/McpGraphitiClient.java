@@ -116,9 +116,12 @@ public class McpGraphitiClient implements GraphitiClient {
             payload = parseTextContent(result);
         }
 
-        JsonNode episodes = payload.isArray() ? payload : payload.path("episodes");
-        if (!episodes.isArray()) {
-            log.debug("get_episodes returned an unrecognised shape, treating as empty");
+        JsonNode episodes = findEpisodesArray(payload);
+        if (episodes == null) {
+            // Loud, not debug. This previously read as "episode absent" and marked five
+            // successfully ingested episodes as DROPPED — a parsing bug wearing the costume
+            // of a 100% server-side drop rate.
+            log.warn("get_episodes returned an unrecognised shape; cannot verify");
             return List.of();
         }
         for (JsonNode episode : episodes) {
@@ -128,6 +131,31 @@ public class McpGraphitiClient implements GraphitiClient {
             }
         }
         return names;
+    }
+
+    /**
+     * Locates the episode array in whatever envelope the server used.
+     *
+     * <p>Measured against the live server, {@code get_episodes} answers
+     * {@code {"result": {"message": "...", "episodes": [...]}}} — the array sits under a
+     * {@code result} wrapper, not at the top level. Other MCP calls answer without it. Rather
+     * than hardcode one shape and silently return "not found" when it changes, this checks the
+     * plausible envelopes explicitly and returns null only when there is genuinely no array,
+     * so the caller can say so instead of inventing an absence.
+     */
+    private JsonNode findEpisodesArray(JsonNode payload) {
+        if (payload == null || payload.isNull() || payload.isMissingNode()) {
+            return null;
+        }
+        if (payload.isArray()) {
+            return payload;
+        }
+        for (JsonNode candidate : List.of(payload.path("episodes"), payload.path("result").path("episodes"))) {
+            if (candidate.isArray()) {
+                return candidate;
+            }
+        }
+        return null;
     }
 
     private JsonNode parseTextContent(JsonNode result) {
