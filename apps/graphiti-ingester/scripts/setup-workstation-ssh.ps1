@@ -89,10 +89,18 @@ $existing = Get-LocalUser -Name $PullUser -ErrorAction SilentlyContinue
 if (-not $existing) {
     # Random, never displayed, never used — password auth is disabled below. The account
     # exists only as an identity to hang the key and the ACL off.
-    Add-Type -AssemblyName 'System.Web'
-    $randomPassword = ConvertTo-SecureString ([System.Web.Security.Membership]::GeneratePassword(32, 8)) -AsPlainText -Force
+    #
+    # Generated from the crypto RNG rather than System.Web's Membership::GeneratePassword:
+    # that pulls in a web assembly for one call, and it is absent from PowerShell 7+.
+    $bytes = [byte[]]::new(24)
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    # Mixed case, digits and a symbol, so it satisfies any local complexity policy.
+    $randomPassword = ConvertTo-SecureString ([Convert]::ToBase64String($bytes) + '!aZ9') -AsPlainText -Force
+
+    # -Description must be 48 characters or fewer. Exceeding it fails the whole call with a
+    # length complaint that does not name the parameter, so keep this short.
     New-LocalUser -Name $PullUser -Password $randomPassword -FullName 'graphiti-kg server pull' `
-        -Description 'Read-only SFTP access to the redacted screenpipe export. Key auth only.' `
+        -Description 'Read-only SFTP for graphiti-kg export pull' `
         -PasswordNeverExpires -UserMayNotChangePassword | Out-Null
     Write-Ok "Created local user $PullUser"
 } else {

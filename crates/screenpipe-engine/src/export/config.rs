@@ -43,8 +43,19 @@ fn default_kinds() -> Vec<SemanticKind> {
 /// permissive for that — see `export/record.rs` for where this is applied.
 fn default_redaction_labels() -> Vec<String> {
     [
-        "person", "email", "phone", "address", "url", "company", "repo", "handle", "channel",
-        "id", "date", "secret", "sensitive",
+        "person",
+        "email",
+        "phone",
+        "address",
+        "url",
+        "company",
+        "repo",
+        "handle",
+        "channel",
+        "id",
+        "date",
+        "secret",
+        "sensitive",
     ]
     .into_iter()
     .map(String::from)

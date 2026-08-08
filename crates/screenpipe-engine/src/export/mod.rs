@@ -62,7 +62,8 @@ pub async fn run_once(data_dir: &Path, dry_run: bool) -> anyhow::Result<ExportSu
     }
 
     let settings = load_recording_settings(data_dir);
-    let cursor = Cursor::<ExportCursorState>::at(data_dir.join("export").join("state").join("cursor.json"));
+    let cursor =
+        Cursor::<ExportCursorState>::at(data_dir.join("export").join("state").join("cursor.json"));
     let state = cursor.load();
 
     let db_path = data_dir.join("db.sqlite");

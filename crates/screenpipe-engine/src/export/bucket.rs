@@ -159,7 +159,11 @@ mod tests {
         let file = local_date(day).format("%Y-%m-%d").to_string();
         let contents = std::fs::read_to_string(dir.path().join(format!("{file}.jsonl"))).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 2, "expected both runs' lines to survive: {contents}");
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected both runs' lines to survive: {contents}"
+        );
         assert!(lines[0].contains("\"local_id\":\"first\""));
         assert!(lines[1].contains("\"local_id\":\"second\""));
     }

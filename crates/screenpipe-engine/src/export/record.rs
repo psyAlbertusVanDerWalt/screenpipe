@@ -134,8 +134,8 @@ impl RecordBuilder {
     pub fn regex_only(data_dir: &Path, redaction_labels: &[String]) -> std::io::Result<Self> {
         let pseudonymizer = Arc::new(Pseudonymizer::load_or_create(data_dir)?);
         let policy = TextRedactionPolicy::from_labels(redaction_labels);
-        let pipeline = Pipeline::regex_only_with_policy(policy)
-            .with_pseudonyms(Some(pseudonymizer.clone()));
+        let pipeline =
+            Pipeline::regex_only_with_policy(policy).with_pseudonyms(Some(pseudonymizer.clone()));
         Ok(Self {
             pipeline,
             pseudonymizer,
@@ -164,8 +164,15 @@ impl RecordBuilder {
                 continue;
             }
             out.push(
-                self.build_one(ctx.frame_id, ctx.timestamp, &ctx.app_name, &window_name, domain.clone(), item)
-                    .await,
+                self.build_one(
+                    ctx.frame_id,
+                    ctx.timestamp,
+                    &ctx.app_name,
+                    &window_name,
+                    domain.clone(),
+                    item,
+                )
+                .await,
             );
         }
         out
@@ -282,7 +289,10 @@ mod tests {
 
     fn all_labels() -> Vec<String> {
         vec![
-            "person".into(), "email".into(), "phone".into(), "address".into(),
+            "person".into(),
+            "email".into(),
+            "phone".into(),
+            "address".into(),
         ]
     }
 

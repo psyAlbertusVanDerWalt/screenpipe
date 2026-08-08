@@ -79,7 +79,8 @@ fn message_projection(body: &str, actor: &str, key_suffix: i64) -> ValidatedProj
     item.body = Some(body.into());
     item.source_nodes = vec![NodeId(0)];
 
-    ValidatedProjection::new(vec![item], &tree, OutputBudget::default()).expect("validate projection")
+    ValidatedProjection::new(vec![item], &tree, OutputBudget::default())
+        .expect("validate projection")
 }
 
 /// Local wall-clock instant, converted to UTC — matches how a real captured
@@ -227,15 +228,24 @@ async fn export_pipeline_filters_redacts_and_buckets_correctly() {
     )
     .await;
 
-    assert!(f1 < f2 && f2 < f3 && f3 < f4, "frame ids should be increasing");
+    assert!(
+        f1 < f2 && f2 < f3 && f3 < f4,
+        "frame ids should be increasing"
+    );
 
     let summary = screenpipe_engine::export::run_once(data_dir, false)
         .await
         .expect("first export run");
 
     assert_eq!(summary.frames_seen, 4);
-    assert_eq!(summary.frames_exported, 2, "only frames 1 and 4 pass both gates");
-    assert_eq!(summary.frames_filtered, 2, "frames 2 (schedule) and 3 (denylist)");
+    assert_eq!(
+        summary.frames_exported, 2,
+        "only frames 1 and 4 pass both gates"
+    );
+    assert_eq!(
+        summary.frames_filtered, 2,
+        "frames 2 (schedule) and 3 (denylist)"
+    );
     assert_eq!(summary.records_written, 2);
     assert_eq!(summary.last_frame_id, f4);
 
@@ -308,14 +318,21 @@ async fn dry_run_does_not_touch_disk_or_cursor() {
         .await
         .expect("dry run");
     assert_eq!(summary.frames_exported, 1);
-    assert_eq!(summary.records_written, 1, "dry run still reports what would be written");
+    assert_eq!(
+        summary.records_written, 1,
+        "dry run still reports what would be written"
+    );
 
     assert!(
         !data_dir.join("export").join("redacted-jsonl").exists(),
         "dry run must not create output files"
     );
     assert!(
-        !data_dir.join("export").join("state").join("cursor.json").exists(),
+        !data_dir
+            .join("export")
+            .join("state")
+            .join("cursor.json")
+            .exists(),
         "dry run must not advance the cursor"
     );
 }

@@ -67,7 +67,11 @@ mod tests {
     use screenpipe_config::ScheduleRule;
     use screenpipe_semantic::Platform;
 
-    fn make_ctx(app_name: &str, window_name: &str, browser_url: Option<&str>) -> SemanticFrameContext {
+    fn make_ctx(
+        app_name: &str,
+        window_name: &str,
+        browser_url: Option<&str>,
+    ) -> SemanticFrameContext {
         SemanticFrameContext {
             frame_id: 1,
             // ScheduleRule times are local; build the fixture as a local
