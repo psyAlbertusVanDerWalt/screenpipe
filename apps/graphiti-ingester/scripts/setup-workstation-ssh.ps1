@@ -140,16 +140,28 @@ Write-Ok "Granted $PullUser read-only on $ExportDir"
 # directory above still wins there — which the script verifies at the end.
 $profileRoot = Split-Path -Parent (Split-Path -Parent $ExportDir)   # ...\.screenpipe
 $profileRoot = Split-Path -Parent $profileRoot                       # the user profile
+
+# InheritanceFlags MUST stay 'None'.
+#
+# The thing being closed is enumeration of the profile root itself — that one directory
+# carries the permissive Everyone ACE; its children do not, which is why reads already
+# failed while listing succeeded. A Deny on this single object is therefore sufficient.
+#
+# Setting ContainerInherit,ObjectInherit here instead makes Set-Acl propagate the ACE to
+# every descendant of the profile: node_modules, scoop, AppData, VM images. On a real
+# profile that is hundreds of thousands of objects, it runs for a very long time while
+# rewriting ACLs far outside the scope of this change, and it does not close the hole any
+# sooner — the root is what matters. Measured doing exactly that before this was corrected.
 $denyAcl = Get-Acl $profileRoot
 $denyRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
     $PullUser,
     'ReadAndExecute',
-    'ContainerInherit,ObjectInherit',
+    'None',
     'None',
     'Deny')
 $denyAcl.SetAccessRule($denyRule)
 Set-Acl -Path $profileRoot -AclObject $denyAcl
-Write-Ok "Denied $PullUser everything under $profileRoot except the export directory"
+Write-Ok "Denied $PullUser listing of $profileRoot (this folder only, no propagation)"
 
 # ---------------------------------------------------------------------------------------
 Write-Step "Installing the authorized key"
