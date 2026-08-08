@@ -77,6 +77,26 @@ Get-ChildItem "$env:USERPROFILE\.screenpipe\export\redacted-jsonl"
 Closed issues carry real decisions in their comments (#9-#12, #20 especially).
 Read the closed ones before re-litigating an ontology, model, or Coolify choice.
 
+## Repo traps that cost real time
+
+**`.gitignore` has a bare `data/` rule** (for screenpipe's capture directories) that
+also matches any source package path containing `data/` — it silently swallowed
+the whole `core/data/` tree of the Java ingester, and `git add` reported nothing.
+After adding files under a new `data/` directory, always confirm with
+`git status` that they were actually staged, or `git check-ignore -v <file>`.
+
+**Java code here needs JDK 21, not the machine default.** `JAVA_HOME` points at
+Temurin 26 while `java` on PATH is 21. Lombok cannot parse a JDK 26 AST and fails
+with `ExceptionInInitializerError: com.sun.tools.javac.code.TypeTag :: UNKNOWN`,
+which names nothing relevant. Build with:
+
+```powershell
+$env:JAVA_HOME = "C:\myprograms\jdk-21.0.6"; mvn test
+```
+
+**Pushing is blocked** for the agent by the permission classifier — commits land
+locally but the user must run `git push origin main` themselves.
+
 ## Related memories
 
 `graphiti-kg-project`, `screenpipe-export-pipeline`, `never-pr-upstream-screenpipe`
