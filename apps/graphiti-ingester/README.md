@@ -316,14 +316,23 @@ The push is covered by unit tests in `export::upload`:
 - The in-process push has not yet run end-to-end against the live ingester from a scheduled
   `screenpipe-export` run — only the endpoint side is verified.
 
-## Known hazard: graphiti-mcp rebuilds from a moving ref
+## Known hazard: restarting graphiti-kg rebuilds graphiti-mcp
 
-The `graphiti-kg` Coolify service builds `graphiti-mcp` from
-`https://github.com/getzep/graphiti.git#main:mcp_server`. Every restart re-clones upstream
-`main` and rebuilds from scratch — minutes of downtime for what should be a container
-restart, against a ref whose contents nobody here controls. Pin it to
-`zepai/knowledge-graph-mcp:1.0.2-standalone` (the published build of that same inline
-Dockerfile) to make restarts fast and deterministic.
+The `graphiti-kg` Coolify service has no `image:` for `graphiti-mcp` — it builds from
+`https://github.com/getzep/graphiti.git#main:mcp_server`. A restart is therefore not a
+restart: Coolify logs `graphiti-mcp Skipped No image to be pulled` and rebuilds from source,
+and the container simply does not exist until that finishes.
+
+What makes it expensive is the `uv sync --extra providers` layer, which resolves to torch and
+the CUDA stack — **~2.3 GB** of wheels (torch 502 MB, cuBLAS 403 MB, cuDNN 349 MB, cuFFT
+204 MB, NCCL 196 MB, cuSOLVER 192 MB, Triton 189 MB, cuSPARSELt 162 MB, cuSPARSE 139 MB) on a
+server with no GPU. Whenever the uv cache mount misses, that download stands between the
+graph and being up, and the endpoint returns nothing the whole time.
+
+Pin `graphiti-mcp` to `zepai/knowledge-graph-mcp:1.0.2-standalone` — upstream's published
+build of this same inline Dockerfile — so a restart is a pull-and-run. Check first that the
+published image carries the `redis<8.1.0` cap the inline Dockerfile applies; without it,
+falkordb-py's sync cluster detection raises `TypeError` on `Redis.__init__`.
 
 Note also the orphaned `graphiti` sub-application (id 121, last online 2026-08-05): it is not
 in the current compose, so it can never start, and with `exclude_from_status: false` it holds
