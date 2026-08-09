@@ -329,10 +329,23 @@ the CUDA stack — **~2.3 GB** of wheels (torch 502 MB, cuBLAS 403 MB, cuDNN 349
 server with no GPU. Whenever the uv cache mount misses, that download stands between the
 graph and being up, and the endpoint returns nothing the whole time.
 
-Pin `graphiti-mcp` to `zepai/knowledge-graph-mcp:1.0.2-standalone` — upstream's published
-build of this same inline Dockerfile — so a restart is a pull-and-run. Check first that the
-published image carries the `redis<8.1.0` cap the inline Dockerfile applies; without it,
-falkordb-py's sync cluster detection raises `TypeError` on `Redis.__init__`.
+Three ways out, in rough order of preference:
+
+1. **Drop `--extra providers`** from the inline Dockerfile's `uv sync`. That extra is what
+   drags in torch; this deployment talks to Ollama over the OpenAI-compatible API, which is
+   in the base dependencies. Keeps graphiti-core 0.29.3, and the build becomes small enough
+   that rebuilding on restart stops mattering.
+2. **Build once and push to `registry.albertusvdw.co.za`** (already in use for the ingester),
+   then point the compose at that tag. Restarts become pull-and-run, and the running version
+   is exactly the one that was tested.
+3. **Pin to `zepai/knowledge-graph-mcp:1.0.2-standalone`.** Simplest, but it is a downgrade:
+   the sibling tag `1.0.2-graphiti-0.28.2-standalone` shows it ships graphiti-core **0.28.2**
+   against the **0.29.3** this service builds. Custom entity/edge types are exactly the area
+   that moved between those, so don't take this one without checking the ontology still binds.
+
+The `redis<8.1.0` cap the inline Dockerfile applies is not a concern for the published image:
+it was pushed 2026-03-11 and redis 8.1.0 only appeared 2026-07-30, so the resolver could not
+have picked it.
 
 Note also the orphaned `graphiti` sub-application (id 121, last online 2026-08-05): it is not
 in the current compose, so it can never start, and with `exclude_from_status: false` it holds
