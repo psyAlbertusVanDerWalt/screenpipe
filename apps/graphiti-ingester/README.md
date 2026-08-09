@@ -208,86 +208,75 @@ everything from scratch, so a fresh database needs no special handling. `ddl-aut
 `validate`, so a drift between the entity and the migration fails at startup rather than
 silently reshaping the table.
 
-## The pull from the workstation (#16)
+## The push from the workstation (#16)
 
-The server pulls; the workstation does not push. A push has to fire at a moment the
-workstation is awake and the server is reachable, and misses its window entirely if either
-is false. A pull just collects whatever accumulated on the next run.
+The workstation pushes over HTTP; the server never reaches back. `screenpipe-export` does
+the `POST` itself, in the same process that just wrote the day files:
 
 ```
-workstation                                  server
-  sshd (LAN only, key only)  <──── sftp ────  pull-export.sh   (Coolify scheduled task)
-  read-only on the export dir                      │
-                                                   ▼
-                                            /data/redacted-jsonl  (shared volume)
-                                                   │
-                                                   ▼
-                                             the ingester
+workstation                                        server
+  screenpipe-export                                  POST /api/v1/export/uploads/{file}
+    write <data-dir>/export/redacted-jsonl/  ──────► bearer token, application/x-ndjson
+    then push every recent *.jsonl                     │
+                                                       ▼
+                                              /data/redacted-jsonl  (volume)
+                                                       │
+                                                       ▼
+                                                 the ingester
 ```
 
-### Workstation setup — needs one elevated run
+The workstation needs no inbound anything — no SSH service, no extra local account, no NTFS
+carve-out, no firewall opening. One outbound call on the LAN.
 
-[`scripts/setup-workstation-ssh.ps1`](scripts/setup-workstation-ssh.ps1), from an elevated
-PowerShell. Idempotent. It installs OpenSSH Server and applies four independent controls:
+The push lives in [`crates/screenpipe-engine/src/export/upload.rs`](../../crates/screenpipe-engine/src/export/upload.rs)
+rather than a second scheduled script, for two reasons. A separate scheduler entry flashes a
+console window on the desktop every time it fires, and two schedules can disagree about which
+files exist — the process that wrote the files always knows.
 
-1. A dedicated `graphiti-pull` local account, in no group beyond Users
-2. NTFS ACLs giving it read-only access to the export directory **and nothing else** — this
-   is the control that actually bounds what can be read
-3. `ForceCommand internal-sftp` — no shell, no arbitrary commands, no forwarding
-4. A firewall rule allowing TCP/22 from the LAN subnet only, replacing the any-source rule
-   the OpenSSH feature installs by default
+### Workstation setup — no elevation
 
-Password auth is off globally, and `AllowUsers` limits login to that one account.
+`<data-dir>/export.toml`:
 
-It deliberately does **not** use `ChrootDirectory`. Win32-OpenSSH requires a chroot target
-owned by SYSTEM or Administrators and not writable by the chrooted user — untrue of a
-directory the export job writes as the logged-in user. Setting it anyway yields an sshd that
-refuses the session with an error that reads like a key problem. The ACLs already bound reads
-to the export directory; chroot would only hide the rest of the tree from listing.
+```toml
+[upload]
+url = "http://10.0.0.69:18080"
+```
 
-The script prints the host key fingerprints at the end. Pin one — do not trust first contact.
+and the shared secret in `<data-dir>/.upload-token`. Both halves are required: a URL with no
+resolvable token logs a warning naming the file and pushes nothing, rather than sending a
+request that can only 401. `INGEST_UPLOAD_TOKEN` overrides the file for one-off runs.
 
-### Server setup
+Other keys, all optional: `token_file` (default `.upload-token`, relative to the data dir),
+`since_days` (default 7, `0` for everything), `max_attempts` (3), `request_timeout_secs` (120).
 
-Two file storages on the Coolify app:
-
-| Mount path | Contents |
-|---|---|
-| `/keys/id_ed25519` | private half of the keypair generated on the workstation |
-| `/keys/known_hosts` | `ssh-keyscan -t ed25519 10.0.0.30`, checked against the printed fingerprint |
-
-Then a scheduled task on the app:
+Then one scheduled task, for the export itself:
 
 | Field | Value |
 |---|---|
-| Command | `/usr/local/bin/pull-export.sh` |
-| Frequency | `0 9,14 * * 1-5` |
-| Container | `graphiti-ingester` |
+| Command | `screenpipe-export.exe --data-dir C:\Users\shortie\.screenpipe` |
+| Frequency | daily |
 
-The command is a script in the image, not inline, because Coolify stores that field in a
-`varchar(255)` and rejects anything longer with a bodyless HTTP 500.
+Pass `--data-dir` explicitly. `$HOME` is unset under Task Scheduler on Windows, and the
+default data-dir lookup silently finds nothing without it.
 
-**Container is mandatory.** Coolify's create-task API happily accepts a task with
-`container: null` and returns success, but the task then has nothing to exec into and never
-runs. Nothing surfaces this — the task simply sits there looking configured.
+Re-sending recent days is deliberate, not wasteful: a day's file keeps growing until that day
+ends, and the server replacing it is how the final version arrives. The ledger is keyed on a
+deterministic episode key, so the same content arriving twice is a no-op.
 
-Schedule it an hour *before* the ingest cron (`0 10,15 * * MON-FRI`) so each ingest works on
-freshly pulled data, and keep both inside working hours — the workstation is asleep otherwise.
+A failed push does not fail the export — the cursor has already advanced and the files on
+disk are the durable record — but `screenpipe-export` exits non-zero so the scheduler's
+last-result column shows it. The next run retries every file inside the `since_days` window,
+so a transient outage self-heals.
 
-Overrides: `PULL_SSH_HOST`, `PULL_SSH_PORT`, `PULL_SSH_USER`, `PULL_REMOTE_DIR`,
-`PULL_SSH_KEY`, `PULL_KNOWN_HOSTS`. `PULL_REMOTE_DIR` defaults to
-`/C:/Users/shortie/.screenpipe/export/redacted-jsonl` — Win32-OpenSSH's sftp server really
-does present drive letters that way.
-
-`rsync` is deliberately not used: it must be installed on both ends, and Windows OpenSSH has
-no rsync, so an rsync-based pull cannot work against this server however it is configured.
-
-### Retiring the old push
+### Retiring the old transports
 
 `screenpipe-sync-sftp` (Coolify service `ljr8cr1uwjqb40ctmmpafjom`) and the disabled
-`screenpipe-sync-to-homeserver` scheduled task are the old push direction. Both are made
-redundant by this pull. The Windows task is already disabled; leave the service running until
-the first successful pull, then remove it.
+`screenpipe-sync-to-homeserver` scheduled task are an older push direction, made redundant by
+this one. Remove them once a push has landed.
+
+The SSH pull that this replaced got as far as installing OpenSSH Server on the workstation.
+[`scripts/teardown-workstation-ssh.ps1`](scripts/teardown-workstation-ssh.ps1), run elevated,
+removes the account, the firewall rule, the ACEs and the `sshd_config` edits.
 
 ## Verified
 
@@ -301,16 +290,14 @@ Against a real export on the workstation, in the built container talking to a re
 - Re-running retries the same 5 and increments `attempts` rather than creating duplicates,
   confirming the episode key is genuinely stable
 
-The pull was verified against a stand-in SFTP server, since the workstation's sshd is not
-installed yet:
+The push is covered by unit tests in `export::upload`:
 
-- Key auth against a pinned host key transfers the files and exits 0
-- A **mismatched** host key is refused — the transfer fails and the script exits 1 rather
-  than trusting the new key
-- Missing key or missing `known_hosts` fails immediately with a message naming the fix,
-  instead of hanging on a prompt inside a cron job
-- Files land in the shared volume owned by `appuser`, and the ingester in a separate
-  container reads them on its next run — the volume handoff works across both
+- A missing `url`, and a `url` with no resolvable token, both push nothing — the second is
+  the one that matters, since it would otherwise send a request that can only 401
+- The token is read from the data dir's `.upload-token` and trimmed
+- A trailing slash on the URL does not double up in the request path
+- Only `*.jsonl` **files** are eligible — a directory named `*.jsonl` is not
+- A missing output directory is not an error
 
 ### Verified in production
 
@@ -318,8 +305,6 @@ installed yet:
   deploy webhook
 - The app is `running:healthy` with `fqdn: null` — Flyway applied `V1` against the real
   Postgres and the readiness probe passes
-- The scheduled task exec's into the container and runs `pull-export.sh`, which reports the
-  one genuinely missing piece: `no private key at /keys/id_ed25519`
 
 ## Still to do
 
@@ -328,9 +313,18 @@ installed yet:
   entity/edge check has no local extraction output to run against yet. Wire it in when
   extraction moves client-side, or use it to audit what came back.
 - Dangling-edge rejection, same reason.
-- Never yet run against the **live** graphiti-mcp endpoint — every test so far deliberately
-  pointed at a dead port to avoid writing into the real graph.
-- The pull has never run against the **real** workstation. `sshd` is not installed there yet;
-  installing it needs an elevated run of `scripts/setup-workstation-ssh.ps1`. Until that
-  happens, `PULL_REMOTE_DIR`'s `/C:/...` path form and the ACL lockdown are both unverified
-  against Win32-OpenSSH.
+- The in-process push has not yet run end-to-end against the live ingester from a scheduled
+  `screenpipe-export` run — only the endpoint side is verified.
+
+## Known hazard: graphiti-mcp rebuilds from a moving ref
+
+The `graphiti-kg` Coolify service builds `graphiti-mcp` from
+`https://github.com/getzep/graphiti.git#main:mcp_server`. Every restart re-clones upstream
+`main` and rebuilds from scratch — minutes of downtime for what should be a container
+restart, against a ref whose contents nobody here controls. Pin it to
+`zepai/knowledge-graph-mcp:1.0.2-standalone` (the published build of that same inline
+Dockerfile) to make restarts fast and deterministic.
+
+Note also the orphaned `graphiti` sub-application (id 121, last online 2026-08-05): it is not
+in the current compose, so it can never start, and with `exclude_from_status: false` it holds
+the whole service short of `running:healthy` no matter what the real containers do.

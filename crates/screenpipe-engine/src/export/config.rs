@@ -66,6 +66,61 @@ fn default_batch_limit() -> u32 {
     500
 }
 
+fn default_token_file() -> String {
+    ".upload-token".to_string()
+}
+
+fn default_since_days() -> u32 {
+    7
+}
+
+fn default_max_attempts() -> u32 {
+    3
+}
+
+fn default_request_timeout_secs() -> u64 {
+    120
+}
+
+/// Where the written JSONL files get pushed, done in-process at the end of an
+/// export run. Off unless `url` is set — an export that writes files locally
+/// and sends them nowhere is the safe default for a pipeline whose whole
+/// point is controlling what leaves the device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UploadConfig {
+    /// Base URL of the ingester, e.g. `http://10.0.0.69:18080`. Empty
+    /// disables the push.
+    pub url: String,
+    /// Shared secret. Prefer `token_file` — this exists for completeness and
+    /// keeps the secret in a file that is at least not world-readable by
+    /// habit the way a config in a repo would be.
+    pub token: String,
+    /// Relative to the data dir unless absolute.
+    #[serde(default = "default_token_file")]
+    pub token_file: String,
+    /// Only push files modified within this window. `0` pushes everything.
+    #[serde(default = "default_since_days")]
+    pub since_days: u32,
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+impl Default for UploadConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            token: String::new(),
+            token_file: default_token_file(),
+            since_days: default_since_days(),
+            max_attempts: default_max_attempts(),
+            request_timeout_secs: default_request_timeout_secs(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExportConfig {
@@ -81,6 +136,8 @@ pub struct ExportConfig {
     /// Rows fetched per `get_semantic_items_since` page.
     #[serde(default = "default_batch_limit")]
     pub batch_limit: u32,
+    #[serde(default)]
+    pub upload: UploadConfig,
 }
 
 impl Default for ExportConfig {
@@ -91,6 +148,7 @@ impl Default for ExportConfig {
             kinds: default_kinds(),
             redaction_labels: default_redaction_labels(),
             batch_limit: default_batch_limit(),
+            upload: UploadConfig::default(),
         }
     }
 }

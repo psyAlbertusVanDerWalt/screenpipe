@@ -23,12 +23,16 @@
 //! 4. Passing frames: build records (`export::record::RecordBuilder`).
 //! 5. Day-bucket + write (`export::bucket::write_daily_batches`).
 //! 6. Save cursor at the max `frame_id` seen this run, pass or fail.
+//! 7. Push the day files to the ingester (`export::upload::push_exports`) —
+//!    in-process, so there is no second scheduled script flashing a console
+//!    window on the desktop every time the push fires.
 
 pub mod bucket;
 pub mod config;
 pub mod cursor_state;
 pub mod filters;
 pub mod record;
+pub mod upload;
 
 use std::path::Path;
 
@@ -49,6 +53,8 @@ pub struct ExportSummary {
     pub records_written: usize,
     pub records_skipped: usize,
     pub last_frame_id: i64,
+    pub files_uploaded: usize,
+    pub files_failed: usize,
 }
 
 /// Run one export pass against `data_dir`. `dry_run` skips the cursor save
@@ -123,6 +129,13 @@ pub async fn run_once(data_dir: &Path, dry_run: bool) -> anyhow::Result<ExportSu
         }) {
             warn!("screenpipe-export: failed to save cursor: {e}");
         }
+
+        // Unconditional, not gated on this run having written anything: a
+        // day file that failed to push last time must get another chance,
+        // and the current day's file keeps growing after it was first sent.
+        let uploaded = upload::push_exports(&config.upload, data_dir, &output_dir).await;
+        summary.files_uploaded = uploaded.files_uploaded;
+        summary.files_failed = uploaded.files_failed;
     }
 
     Ok(summary)
