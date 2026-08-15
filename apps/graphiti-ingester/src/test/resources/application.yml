@@ -12,7 +12,9 @@ spring:
 
 ingest:
   export-dir: target/test-exports
-  group-id: test-group
+  work-group-id: test-work
+  personal-group-id: test-personal
+  unclassified-group-id: test-unclassified
   day-boundary-zone: Africa/Johannesburg
   schedule:
     enabled: false

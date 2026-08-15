@@ -6,6 +6,7 @@ import lombok.Getter;
 import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
+import za.co.albertusvdw.graphiti.ingester.core.data.episode.ActivityDomain;
 
 /** Tunables for reading the export and shaping episodes. */
 @Getter
@@ -24,9 +25,32 @@ public class IngestProperties {
     @NotBlank
     private String exportDir = "/data/redacted-jsonl";
 
-    /** Graphiti partition to write into. Keeps this data separate from other graph sources. */
+    /**
+     * Graphiti partitions episodes are routed into, by {@link za.co.albertusvdw.graphiti.ingester.core.data.episode.ActivityDomain}.
+     *
+     * <p>Three separate partitions, not one — a work/personal mixup here is exactly the failure
+     * a timesheet or a "what did I do yesterday" summary can't tolerate. Unclassified activity
+     * gets its own partition rather than falling into either side by default, so anything the
+     * classifier wasn't confident about stays visible and reviewable instead of silently
+     * miscounted as billable work or silently dropped from the work view.
+     */
     @NotBlank
-    private String groupId = "screenpipe";
+    private String workGroupId = "screenpipe-work";
+
+    @NotBlank
+    private String personalGroupId = "screenpipe-personal";
+
+    @NotBlank
+    private String unclassifiedGroupId = "screenpipe-unclassified";
+
+    /** The single place that turns a domain decision into the partition it gets posted to. */
+    public String groupIdFor(ActivityDomain domain) {
+        return switch (domain) {
+            case WORK -> workGroupId;
+            case PERSONAL -> personalGroupId;
+            case UNCLASSIFIED -> unclassifiedGroupId;
+        };
+    }
 
     /** Zone used to decide which local day a row belongs to when keying episodes. */
     @NotBlank

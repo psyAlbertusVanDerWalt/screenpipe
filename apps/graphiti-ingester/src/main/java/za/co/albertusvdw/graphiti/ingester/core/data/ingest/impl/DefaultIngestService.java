@@ -132,7 +132,7 @@ public class DefaultIngestService implements IngestService {
     }
 
     private IngestStatus ingestOne(Episode episode) {
-        String groupId = ingestProperties.getGroupId();
+        String groupId = ingestProperties.groupIdFor(episode.domain());
         IngestedEpisode ledgerRow = ledger.claim(episode, groupId);
 
         // Already sent on an earlier run? Check whether it has since landed before sending it

@@ -23,7 +23,7 @@ class DefaultEpisodeGrouperTest {
         IngestProperties properties = new IngestProperties();
         properties.setDayBoundaryZone("Africa/Johannesburg");
         properties.setMaxEpisodeBodyChars(200);
-        grouper = new DefaultEpisodeGrouper(properties);
+        grouper = new DefaultEpisodeGrouper(properties, new DefaultActivityDomainClassifier());
     }
 
     @Test

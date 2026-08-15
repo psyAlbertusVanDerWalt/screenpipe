@@ -15,6 +15,8 @@ import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import za.co.albertusvdw.graphiti.ingester.application.config.IngestProperties;
+import za.co.albertusvdw.graphiti.ingester.core.data.episode.ActivityDomain;
+import za.co.albertusvdw.graphiti.ingester.core.data.episode.ActivityDomainClassifier;
 import za.co.albertusvdw.graphiti.ingester.core.data.episode.Episode;
 import za.co.albertusvdw.graphiti.ingester.core.data.episode.EpisodeGrouper;
 import za.co.albertusvdw.graphiti.ingester.core.data.export.ExportRecord;
@@ -59,10 +61,12 @@ public class DefaultEpisodeGrouper implements EpisodeGrouper {
             "static", "statictext", "generic", "none", "window", "dialog", "scrollbar", "separator");
 
     private final IngestProperties properties;
+    private final ActivityDomainClassifier domainClassifier;
     private final ZoneId dayBoundaryZone;
 
-    public DefaultEpisodeGrouper(IngestProperties properties) {
+    public DefaultEpisodeGrouper(IngestProperties properties, ActivityDomainClassifier domainClassifier) {
         this.properties = properties;
+        this.domainClassifier = domainClassifier;
         this.dayBoundaryZone = ZoneId.of(properties.getDayBoundaryZone());
     }
 
@@ -142,6 +146,7 @@ public class DefaultEpisodeGrouper implements EpisodeGrouper {
                 nameFor(anchor),
                 renderBody(all),
                 anchor.kind(),
+                domainClassifier.classify(anchor.appName(), anchor.windowName(), anchor.domain()),
                 anchor.bestEffortOccurredAt(),
                 all.stream().map(ExportRecord::frameId).distinct().sorted().toList());
     }
@@ -175,6 +180,7 @@ public class DefaultEpisodeGrouper implements EpisodeGrouper {
                             anchor.appName() + " activity",
                             renderBody(rows),
                             SemanticKind.CONVERSATION,
+                            domainClassifier.classify(anchor.appName(), anchor.windowName(), anchor.domain()),
                             anchor.bestEffortOccurredAt(),
                             rows.stream().map(ExportRecord::frameId).distinct().sorted().toList());
                 })

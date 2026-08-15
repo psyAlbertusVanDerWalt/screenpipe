@@ -24,6 +24,16 @@ here can tell redacted from raw by inspection.
 
 ## Design notes
 
+**Work and personal never share a partition.** Every episode gets a deterministic
+`ActivityDomain` (`WORK`, `PERSONAL`, or `UNCLASSIFIED`) from `ActivityDomainClassifier` —
+keyword/domain matching against the app name, window title, and (when the row came from a
+browser tab) the URL's domain, the strongest signal available since it's the one thing kept
+through redaction. This is deliberately not an LLM call: the whole point is a timesheet or a
+"what did I do yesterday" summary that can't mix the two, and the extraction model's own JSON
+has been measured malformed often enough in this deployment that it isn't trusted with that
+decision. Anything that doesn't clearly match either side lands in its own `UNCLASSIFIED`
+partition rather than being guessed — see `IngestProperties.groupIdFor`.
+
 **Episodes, not rows.** A day's export is a few hundred rows but only a handful of
 episodes — a real run over `2026-08-07.jsonl` turned 253 rows into 5 episodes. Since each
 episode costs one extraction, row-level ingestion would have cost ~50x more and produced a
@@ -92,7 +102,9 @@ Every value is env-overridable; nothing is hardcoded to one machine.
 | Variable | Default | Notes |
 |---|---|---|
 | `INGEST_EXPORT_DIR` | `/data/redacted-jsonl` | Where #16 drops the pulled files |
-| `INGEST_GROUP_ID` | `screenpipe` | Graphiti partition |
+| `INGEST_WORK_GROUP_ID` | `screenpipe-work` | Graphiti partition for work activity |
+| `INGEST_PERSONAL_GROUP_ID` | `screenpipe-personal` | Graphiti partition for personal activity |
+| `INGEST_UNCLASSIFIED_GROUP_ID` | `screenpipe-unclassified` | Partition for anything the classifier isn't confident about — never guessed into work or personal |
 | `INGEST_DAY_BOUNDARY_ZONE` | `Africa/Johannesburg` | Decides which local day a row belongs to |
 | `INGEST_SCHEDULE_CRON` | `0 0 10,15 * * MON-FRI` | Must stay inside working hours — see below |
 | `GRAPHITI_MCP_URL` | `http://10.0.0.69:18000/mcp/` | LAN-only |

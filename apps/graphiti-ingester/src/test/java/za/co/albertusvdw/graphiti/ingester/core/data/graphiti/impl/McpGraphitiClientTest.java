@@ -13,6 +13,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.web.client.RestClient;
 import za.co.albertusvdw.graphiti.ingester.application.config.GraphitiProperties;
 import za.co.albertusvdw.graphiti.ingester.core.common.exception.GraphitiException;
+import za.co.albertusvdw.graphiti.ingester.core.data.episode.ActivityDomain;
 import za.co.albertusvdw.graphiti.ingester.core.data.episode.Episode;
 import za.co.albertusvdw.graphiti.ingester.core.data.export.SemanticKind;
 
@@ -37,7 +38,13 @@ class McpGraphitiClientTest {
         // unwrapped. Callers catch GraphitiException, so it sailed past the per-episode handler
         // and aborted the whole batch with a 500 — the opposite of resume-from-cursor.
         Episode episode = new Episode(
-                "key", "name", "body", SemanticKind.DOCUMENT, Instant.parse("2026-08-07T09:00:00Z"), List.of(1L));
+                "key",
+                "name",
+                "body",
+                SemanticKind.DOCUMENT,
+                ActivityDomain.UNCLASSIFIED,
+                Instant.parse("2026-08-07T09:00:00Z"),
+                List.of(1L));
 
         assertThatThrownBy(() -> client.addMemory(episode, "group"))
                 .isInstanceOf(GraphitiException.class)
