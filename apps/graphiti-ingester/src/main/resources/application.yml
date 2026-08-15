@@ -28,7 +28,10 @@ ingest:
   upload-token: ${INGEST_UPLOAD_TOKEN:}
   max-upload-bytes: 67108864
   day-boundary-zone: ${INGEST_DAY_BOUNDARY_ZONE:Africa/Johannesburg}
-  max-episode-body-chars: 12000
+  # graphiti-core's extraction has been observed to silently under-extract — miss entities
+  # and relationships with no error — on episodes beyond roughly 10,000 characters. Kept
+  # safely under that rather than at the model's hard context ceiling.
+  max-episode-body-chars: ${INGEST_MAX_EPISODE_BODY_CHARS:8000}
   min-episode-body-chars: 40
   batch-size: 500
   schedule:

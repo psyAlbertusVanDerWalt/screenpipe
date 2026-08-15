@@ -32,9 +32,15 @@ public class IngestProperties {
     @NotBlank
     private String dayBoundaryZone = "Africa/Johannesburg";
 
-    /** Ceiling on a single episode body, to stay inside the extraction model's context. */
+    /**
+     * Ceiling on a single episode body.
+     *
+     * <p>Not just a context-window guard — graphiti-core's extraction has been observed to
+     * silently under-extract (miss entities and relationships, no error) well before the
+     * model's actual context limit, somewhere past ~10,000 characters. Kept safely under that.
+     */
     @Min(500)
-    private int maxEpisodeBodyChars = 12_000;
+    private int maxEpisodeBodyChars = 8_000;
 
     /** Rows read per batch when streaming a file. */
     @Min(1)
