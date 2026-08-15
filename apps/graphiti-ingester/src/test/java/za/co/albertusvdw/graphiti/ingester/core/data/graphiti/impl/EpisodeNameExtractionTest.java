@@ -11,6 +11,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.client.RestClient;
 import za.co.albertusvdw.graphiti.ingester.application.config.GraphitiProperties;
+import za.co.albertusvdw.graphiti.ingester.core.data.graphiti.EpisodeSnapshot;
 
 /**
  * Pins the shapes {@code get_episodes} actually answers with.
@@ -35,11 +36,15 @@ class EpisodeNameExtractionTest {
     }
 
     @SuppressWarnings("unchecked")
-    private List<String> extract(String json) throws Exception {
+    private List<EpisodeSnapshot> extract(String json) throws Exception {
         Method method = McpGraphitiClient.class.getDeclaredMethod(
-                "extractEpisodeNames", com.fasterxml.jackson.databind.JsonNode.class);
+                "extractEpisodeSnapshots", com.fasterxml.jackson.databind.JsonNode.class);
         method.setAccessible(true);
-        return (List<String>) method.invoke(client, objectMapper.readTree(json));
+        return (List<EpisodeSnapshot>) method.invoke(client, objectMapper.readTree(json));
+    }
+
+    private List<String> names(String json) throws Exception {
+        return extract(json).stream().map(EpisodeSnapshot::name).toList();
     }
 
     @Test
@@ -52,7 +57,7 @@ class EpisodeNameExtractionTest {
                 {"uuid":"b","name":"Command Prompt","group_id":"screenpipe"}]}}}
                 """;
 
-        assertThat(extract(body)).containsExactly("edit", "Command Prompt");
+        assertThat(names(body)).containsExactly("edit", "Command Prompt");
     }
 
     @Test
@@ -60,7 +65,7 @@ class EpisodeNameExtractionTest {
     void readsTheFlatShape() throws Exception {
         String body = "{\"structuredContent\":{\"episodes\":[{\"name\":\"standup\"}]}}";
 
-        assertThat(extract(body)).containsExactly("standup");
+        assertThat(names(body)).containsExactly("standup");
     }
 
     @Test
@@ -70,7 +75,7 @@ class EpisodeNameExtractionTest {
                 "{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"result\\\":{\\\"episodes\\\":"
                         + "[{\\\"name\\\":\\\"from-text\\\"}]}}\"}]}";
 
-        assertThat(extract(body)).containsExactly("from-text");
+        assertThat(names(body)).containsExactly("from-text");
     }
 
     @Test
@@ -84,6 +89,14 @@ class EpisodeNameExtractionTest {
     void skipsNamelessEpisodes() throws Exception {
         String body = "{\"structuredContent\":{\"result\":{\"episodes\":[{\"uuid\":\"a\"},{\"name\":\"kept\"}]}}}";
 
-        assertThat(extract(body)).containsExactly("kept");
+        assertThat(names(body)).containsExactly("kept");
+    }
+
+    @Test
+    @DisplayName("content travels alongside name, so callers can tell two same-named episodes apart")
+    void carriesContentAlongsideName() throws Exception {
+        String body = "{\"structuredContent\":{\"episodes\":[{\"name\":\"Email - Outlook\",\"content\":\"body one\"}]}}";
+
+        assertThat(extract(body)).containsExactly(new EpisodeSnapshot("Email - Outlook", "body one"));
     }
 }

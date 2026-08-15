@@ -47,9 +47,9 @@ class McpGraphitiClientTest {
     }
 
     @Test
-    @DisplayName("episodeNames wraps transport failures the same way")
+    @DisplayName("recentEpisodes wraps transport failures the same way")
     void wrapsTransportFailuresWhenVerifying() {
-        assertThatThrownBy(() -> client.episodeNames("group", 10)).isInstanceOf(GraphitiException.class);
+        assertThatThrownBy(() -> client.recentEpisodes("group", 10)).isInstanceOf(GraphitiException.class);
     }
 
     @Test

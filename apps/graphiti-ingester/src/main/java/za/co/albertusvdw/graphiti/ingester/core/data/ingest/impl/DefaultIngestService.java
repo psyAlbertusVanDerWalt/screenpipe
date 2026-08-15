@@ -12,6 +12,7 @@ import za.co.albertusvdw.graphiti.ingester.core.common.exception.GraphitiExcepti
 import za.co.albertusvdw.graphiti.ingester.core.data.episode.Episode;
 import za.co.albertusvdw.graphiti.ingester.core.data.episode.EpisodeGrouper;
 import za.co.albertusvdw.graphiti.ingester.core.data.export.ExportReader;
+import za.co.albertusvdw.graphiti.ingester.core.data.graphiti.EpisodeSnapshot;
 import za.co.albertusvdw.graphiti.ingester.core.data.graphiti.GraphitiClient;
 import za.co.albertusvdw.graphiti.ingester.core.data.ingest.IngestLedgerService;
 import za.co.albertusvdw.graphiti.ingester.core.data.ingest.IngestService;
@@ -39,6 +40,20 @@ public class DefaultIngestService implements IngestService {
      * episodes in the same batch have landed on top of it.
      */
     private static final int VERIFY_WINDOW = 100;
+
+    /**
+     * How many leading characters of the body must agree for two episodes to be treated as the
+     * same one.
+     *
+     * <p>Episode names are window titles ("Email - [PERSON_x] - Outlook") and recur constantly
+     * across genuinely distinct episodes, so name equality alone is not enough to confirm a
+     * specific episode landed — see {@link EpisodeSnapshot}. Kept at
+     * {@code minEpisodeBodyChars}'s default (40) so every episode that reaches this check has
+     * enough body to compare, on both sides: ours because the thin-episode filter already
+     * guarantees it, graphiti's because truncation in {@code get_episodes} responses, when it
+     * happens, has only ever been observed well past this length.
+     */
+    private static final int CONTENT_MATCH_CHARS = 40;
 
     private final ExportReader exportReader;
     private final EpisodeGrouper episodeGrouper;
@@ -214,7 +229,7 @@ public class DefaultIngestService implements IngestService {
     /** Single immediate presence check, with no waiting — used before deciding to re-post. */
     private boolean isAlreadyInGraph(Episode episode, String groupId) {
         try {
-            return graphitiClient.episodeNames(groupId, VERIFY_WINDOW).contains(episode.name());
+            return landed(episode, graphitiClient.recentEpisodes(groupId, VERIFY_WINDOW));
         } catch (GraphitiException exception) {
             // Unknown, not absent. Fall through to posting: a duplicate is recoverable, a
             // permanently missing episode is not.
@@ -234,7 +249,7 @@ public class DefaultIngestService implements IngestService {
         for (int attempt = 1; attempt <= graphitiProperties.getVerifyAttempts(); attempt++) {
             sleep(graphitiProperties.getVerifyDelay());
             try {
-                if (graphitiClient.episodeNames(groupId, VERIFY_WINDOW).contains(episode.name())) {
+                if (landed(episode, graphitiClient.recentEpisodes(groupId, VERIFY_WINDOW))) {
                     return true;
                 }
             } catch (GraphitiException exception) {
@@ -244,6 +259,25 @@ public class DefaultIngestService implements IngestService {
             }
         }
         return false;
+    }
+
+    /**
+     * True when a snapshot in {@code candidates} is this specific episode, not merely one that
+     * shares its window-title name. See {@link EpisodeSnapshot} for why name alone is unsound.
+     */
+    private boolean landed(Episode episode, List<EpisodeSnapshot> candidates) {
+        String expected = contentPrefix(episode.body());
+        return candidates.stream()
+                .anyMatch(candidate ->
+                        episode.name().equals(candidate.name()) && contentPrefix(candidate.content()).equals(expected));
+    }
+
+    private String contentPrefix(String value) {
+        if (value == null) {
+            return "";
+        }
+        String stripped = value.strip();
+        return stripped.substring(0, Math.min(CONTENT_MATCH_CHARS, stripped.length()));
     }
 
     private Duration nextBackoff(Duration current) {

@@ -17,6 +17,7 @@ import org.springframework.web.client.RestClientException;
 import za.co.albertusvdw.graphiti.ingester.application.config.GraphitiProperties;
 import za.co.albertusvdw.graphiti.ingester.core.common.exception.GraphitiException;
 import za.co.albertusvdw.graphiti.ingester.core.data.episode.Episode;
+import za.co.albertusvdw.graphiti.ingester.core.data.graphiti.EpisodeSnapshot;
 import za.co.albertusvdw.graphiti.ingester.core.data.graphiti.GraphitiClient;
 
 /**
@@ -80,13 +81,13 @@ public class McpGraphitiClient implements GraphitiClient {
     }
 
     @Override
-    public List<String> episodeNames(String groupId, int maxEpisodes) {
+    public List<EpisodeSnapshot> recentEpisodes(String groupId, int maxEpisodes) {
         JsonNode result = callTool(
                 "get_episodes", Map.of("group_ids", List.of(groupId), "max_episodes", maxEpisodes));
         if (isToolError(result)) {
             throw new GraphitiException("get_episodes reported an error: " + textOf(result), true);
         }
-        return extractEpisodeNames(result);
+        return extractEpisodeSnapshots(result);
     }
 
     @Override
@@ -101,7 +102,7 @@ public class McpGraphitiClient implements GraphitiClient {
     }
 
     /**
-     * Pulls episode names out of whichever shape the server answered with.
+     * Pulls episode name+content pairs out of whichever shape the server answered with.
      *
      * <p>get_episodes has been observed returning both a structured payload and a JSON blob
      * wrapped in a text content block, so both are handled rather than assuming one. An
@@ -109,8 +110,8 @@ public class McpGraphitiClient implements GraphitiClient {
      * retries — the safe direction, since treating it as found would mark a dropped episode
      * as ingested.
      */
-    private List<String> extractEpisodeNames(JsonNode result) {
-        List<String> names = new ArrayList<>();
+    private List<EpisodeSnapshot> extractEpisodeSnapshots(JsonNode result) {
+        List<EpisodeSnapshot> snapshots = new ArrayList<>();
         JsonNode payload = result.path("structuredContent");
         if (payload.isMissingNode() || payload.isNull()) {
             payload = parseTextContent(result);
@@ -127,10 +128,10 @@ public class McpGraphitiClient implements GraphitiClient {
         for (JsonNode episode : episodes) {
             String name = episode.path("name").asText(null);
             if (name != null && !name.isBlank()) {
-                names.add(name);
+                snapshots.add(new EpisodeSnapshot(name, episode.path("content").asText("")));
             }
         }
-        return names;
+        return snapshots;
     }
 
     /**

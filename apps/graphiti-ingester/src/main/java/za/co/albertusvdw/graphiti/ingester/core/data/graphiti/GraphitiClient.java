@@ -21,12 +21,13 @@ public interface GraphitiClient {
     void addMemory(Episode episode, String groupId);
 
     /**
-     * Names of the most recent episodes in a group, newest first.
+     * The most recent episodes in a group, newest first.
      *
      * <p>Used to confirm a posted episode actually landed, since that cannot be inferred
-     * from {@link #addMemory} returning normally.
+     * from {@link #addMemory} returning normally. Callers must match on more than
+     * {@link EpisodeSnapshot#name()} — see its javadoc for why.
      */
-    List<String> episodeNames(String groupId, int maxEpisodes);
+    List<EpisodeSnapshot> recentEpisodes(String groupId, int maxEpisodes);
 
     /** True when the server is up and connected to its database. */
     boolean isHealthy();
