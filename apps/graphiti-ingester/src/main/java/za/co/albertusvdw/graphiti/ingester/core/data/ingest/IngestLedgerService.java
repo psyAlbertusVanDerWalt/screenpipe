@@ -26,5 +26,14 @@ public interface IngestLedgerService {
 
     void markFailed(Long id, IngestStatus terminalStatus, String error);
 
+    /**
+     * Gives every currently-FAILED row a fresh attempt budget, so the next scheduled run
+     * retries them instead of leaving them abandoned. See {@link IngestStatus#isTerminal()}
+     * for why FAILED needs an explicit way back rather than retrying itself on a schedule.
+     *
+     * @return how many rows were reset
+     */
+    int retryFailed();
+
     IngestReport report();
 }

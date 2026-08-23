@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.RestController;
 import za.co.albertusvdw.graphiti.ingester.application.web.controller.v1.mapper.IngestMapper;
 import za.co.albertusvdw.graphiti.ingester.application.web.controller.v1.responses.IngestReportResponse;
 import za.co.albertusvdw.graphiti.ingester.application.web.controller.v1.responses.IngestSummaryResponse;
+import za.co.albertusvdw.graphiti.ingester.application.web.controller.v1.responses.RetryFailedResponse;
 import za.co.albertusvdw.graphiti.ingester.core.data.ingest.IngestLedgerService;
 import za.co.albertusvdw.graphiti.ingester.core.data.ingest.IngestService;
 
@@ -41,5 +42,19 @@ public class IngestController {
     @GetMapping("/report")
     public ResponseEntity<IngestReportResponse> report() {
         return ResponseEntity.ok(ingestMapper.toResponse(ledgerService.report()));
+    }
+
+    /**
+     * Gives every FAILED episode a fresh attempt budget, without running an ingest.
+     *
+     * <p>FAILED is terminal precisely so it never quietly retries itself on a schedule — see
+     * {@link za.co.albertusvdw.graphiti.ingester.core.data.ingest.IngestStatus#isTerminal()}.
+     * This is the deliberate way back, worth reaching for after something that plausibly
+     * changes the outcome for previously-abandoned episodes, e.g. swapping the extraction
+     * model. Doesn't post anything itself — follow with a {@code POST /runs} to actually retry.
+     */
+    @PostMapping("/retry-failed")
+    public ResponseEntity<RetryFailedResponse> retryFailed() {
+        return ResponseEntity.ok(new RetryFailedResponse(ledgerService.retryFailed()));
     }
 }

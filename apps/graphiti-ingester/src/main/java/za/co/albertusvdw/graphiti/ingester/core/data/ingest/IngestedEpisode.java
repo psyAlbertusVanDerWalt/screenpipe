@@ -88,6 +88,20 @@ public class IngestedEpisode extends AbstractAuditedEntity {
         this.lastError = truncate(error);
     }
 
+    /**
+     * Gives a permanently-FAILED row a fresh attempt budget.
+     *
+     * <p>The only path back from FAILED — see {@link IngestStatus#isTerminal()}. Worth calling
+     * after something that plausibly changes the outcome, e.g. swapping the extraction model:
+     * a row that failed under one model has never actually been retried under a better one.
+     */
+    public void resetForRetry() {
+        this.status = IngestStatus.PENDING;
+        this.attempts = 0;
+        this.postedAt = null;
+        this.lastError = null;
+    }
+
     /** Keeps a long stack trace or model dump from failing the insert on column length. */
     private String truncate(String error) {
         if (error == null) {

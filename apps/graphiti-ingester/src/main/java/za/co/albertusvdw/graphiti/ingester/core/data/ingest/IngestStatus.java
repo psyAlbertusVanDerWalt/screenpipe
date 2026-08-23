@@ -27,8 +27,17 @@ public enum IngestStatus {
     /** Rejected before posting because it would have poisoned the graph. */
     REJECTED;
 
-    /** Whether a later run should leave this episode alone. */
+    /**
+     * Whether a later run should leave this episode alone.
+     *
+     * <p>{@link #FAILED} counts as terminal on purpose, even though it is a failure: without
+     * this, a run that finds {@code attempts > maxAttempts} re-claims the row, bumps
+     * {@code attempts} again, and re-marks it FAILED with the same generic message — forever,
+     * every run, overwriting whatever the real last error was. The only way back from FAILED is
+     * the explicit retry-failed maintenance operation, which resets attempts to zero — not
+     * quietly retrying itself into the same wall on a schedule.
+     */
     public boolean isTerminal() {
-        return this == VERIFIED || this == REJECTED;
+        return this == VERIFIED || this == REJECTED || this == FAILED;
     }
 }

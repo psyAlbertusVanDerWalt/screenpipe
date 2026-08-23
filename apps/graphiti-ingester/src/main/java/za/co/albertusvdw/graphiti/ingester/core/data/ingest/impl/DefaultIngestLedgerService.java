@@ -62,6 +62,15 @@ public class DefaultIngestLedgerService implements IngestLedgerService {
     }
 
     @Override
+    @Transactional
+    public int retryFailed() {
+        List<IngestedEpisode> failed = repository.findByStatusOrderByOccurredAtAsc(IngestStatus.FAILED);
+        failed.forEach(IngestedEpisode::resetForRetry);
+        repository.saveAll(failed);
+        return failed.size();
+    }
+
+    @Override
     public IngestReport report() {
         return new IngestReport(
                 repository.countByStatus(IngestStatus.PENDING),
