@@ -108,7 +108,19 @@ impl RecordBuilder {
                     ai,
                     PipelineConfig {
                         policy: policy.clone(),
-                        ..Default::default()
+                        // PipelineConfig::default()'s ai_min_chars/ai_skip_if_regex_spans are
+                        // tuned to keep live, always-on capture from calling the AI model on
+                        // every trivial window-title fragment. Export is an offline once-a-day
+                        // batch job with no latency budget to protect — inheriting that tradeoff
+                        // here only creates a recall gap: a short window title like "Bob - Zoom"
+                        // (10 chars) never reaches the AI pass at all under the default
+                        // ai_min_chars=12, and a body with >=5 regex hits (emails, URLs) skips
+                        // the AI pass entirely under ai_skip_if_regex_spans=5, so a real name
+                        // sitting alongside that many structured spans leaks verbatim. Export's
+                        // whole privacy guarantee is that unredacted text never leaves the
+                        // workstation, so recall matters far more than latency here.
+                        ai_min_chars: 1,
+                        ai_skip_if_regex_spans: usize::MAX,
                     },
                 )
             }

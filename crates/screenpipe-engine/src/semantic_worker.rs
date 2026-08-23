@@ -4,10 +4,15 @@
 
 //! Opt-in semantic projection worker.
 //!
-//! Capture publishes only after a frame is durable. A watch channel keeps one
-//! pending job, replacing stale work when capture outruns parsing. The capture
-//! loop never awaits parser or database capacity, and disabled configurations
-//! never construct this worker.
+//! Capture publishes only after a frame is durable. A bounded FIFO queue
+//! holds up to [`SEMANTIC_QUEUE_DEPTH`] pending jobs so a short burst of
+//! activity — rapid tab-switching, fast iteration through a datasheet — gets
+//! processed in order rather than decimated down to whichever frame happened
+//! to be newest. The capture loop never awaits parser or database capacity —
+//! `submit` uses `try_send`, so once the queue is genuinely full (sustained
+//! overload, not just a burst) the newest frame is dropped rather than
+//! blocking capture — and disabled configurations never construct this
+//! worker.
 
 use chrono::{DateTime, Utc};
 use screenpipe_a11y::tree::{AccessibilityTreeNode, TreeSnapshot};
@@ -23,14 +28,20 @@ use serde_json::{json, Value};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::runtime::Handle;
-use tokio::sync::watch;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 const SEMANTIC_TELEMETRY_SAMPLE_DENOMINATOR: i64 = 100;
 
+/// How many frames the worker will hold while it catches up on a burst.
+/// Each slot holds a full `TreeSnapshot`, so this trades a bounded amount of
+/// memory for not decimating bursts down to a single frame — see the module
+/// doc comment.
+const SEMANTIC_QUEUE_DEPTH: usize = 8;
+
 #[derive(Clone)]
 pub(crate) struct SemanticProjectionSender {
-    tx: watch::Sender<Option<Arc<SemanticProjectionJob>>>,
+    tx: mpsc::Sender<Arc<SemanticProjectionJob>>,
 }
 
 pub(crate) struct SemanticProjectionJob {
@@ -65,10 +76,21 @@ impl SemanticProjectionJob {
 }
 
 impl SemanticProjectionSender {
-    /// Replace any pending tree with the newest durable frame. This is
-    /// intentionally synchronous and bounded to one pending allocation.
+    /// Enqueues a durable frame for semantic parsing. Intentionally
+    /// synchronous and non-blocking: `try_send` either queues the job or,
+    /// if the worker has fallen behind enough to fill
+    /// [`SEMANTIC_QUEUE_DEPTH`], drops this one frame and logs it — capture
+    /// itself never waits on parser or database capacity.
     pub(crate) fn submit(&self, job: SemanticProjectionJob) {
-        self.tx.send_replace(Some(Arc::new(job)));
+        if let Err(mpsc::error::TrySendError::Full(job)) = self.tx.try_send(Arc::new(job)) {
+            warn!(
+                frame_id = job.frame_id,
+                depth = SEMANTIC_QUEUE_DEPTH,
+                "semantic projection queue full; frame dropped"
+            );
+        }
+        // Closed (worker task ended) is silently ignored, same as a full queue:
+        // capture must never block or fail because the worker isn't keeping up.
     }
 }
 
@@ -81,7 +103,6 @@ pub(crate) fn spawn_semantic_projection_worker(
     runtime.spawn(run_semantic_projection_worker(
         db,
         rx,
-        tx.tx.clone(),
         semantic_mode_label(mode),
     ));
     info!("semantic projection worker enabled");
@@ -99,16 +120,15 @@ const fn semantic_mode_label(mode: SemanticContextMode) -> &'static str {
 
 fn semantic_projection_channel() -> (
     SemanticProjectionSender,
-    watch::Receiver<Option<Arc<SemanticProjectionJob>>>,
+    mpsc::Receiver<Arc<SemanticProjectionJob>>,
 ) {
-    let (tx, rx) = watch::channel(None);
+    let (tx, rx) = mpsc::channel(SEMANTIC_QUEUE_DEPTH);
     (SemanticProjectionSender { tx }, rx)
 }
 
 async fn run_semantic_projection_worker(
     db: Arc<DatabaseManager>,
-    mut rx: watch::Receiver<Option<Arc<SemanticProjectionJob>>>,
-    tx: watch::Sender<Option<Arc<SemanticProjectionJob>>>,
+    mut rx: mpsc::Receiver<Arc<SemanticProjectionJob>>,
     mode_label: &'static str,
 ) {
     let registry = match builtin_parser_registry() {
@@ -119,24 +139,7 @@ async fn run_semantic_projection_worker(
         }
     };
 
-    while rx.changed().await.is_ok() {
-        let Some(job) = rx.borrow_and_update().clone() else {
-            continue;
-        };
-        // Release the channel's copy while this job runs. If capture already
-        // published something newer, pointer identity prevents us from
-        // clearing that pending frame.
-        tx.send_if_modified(|pending| {
-            if pending
-                .as_ref()
-                .is_some_and(|pending| Arc::ptr_eq(pending, &job))
-            {
-                *pending = None;
-                true
-            } else {
-                false
-            }
-        });
+    while let Some(job) = rx.recv().await {
         if let Err(error) = process_semantic_job(&db, &registry, &job, mode_label).await {
             warn!(
                 frame_id = job.frame_id,
@@ -529,14 +532,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_slot_keeps_only_latest_frame() {
+    async fn queue_delivers_a_burst_in_order_instead_of_decimating_it() {
         let (sender, mut receiver) = semantic_projection_channel();
         sender.submit(job(1, "first"));
         sender.submit(job(2, "second"));
 
-        receiver.changed().await.expect("sender remains open");
-        let pending = receiver.borrow_and_update().clone().expect("pending job");
-        assert_eq!(pending.frame_id, 2);
+        let first = receiver.recv().await.expect("sender remains open");
+        assert_eq!(first.frame_id, 1);
+        let second = receiver.recv().await.expect("sender remains open");
+        assert_eq!(second.frame_id, 2);
+    }
+
+    #[tokio::test]
+    async fn overflowing_the_queue_drops_the_new_frame_not_the_queued_ones() {
+        let (sender, mut receiver) = semantic_projection_channel();
+        for frame_id in 0..SEMANTIC_QUEUE_DEPTH as i64 {
+            sender.submit(job(frame_id, "queued"));
+        }
+        // One more than the bounded queue can hold.
+        sender.submit(job(999, "dropped"));
+
+        for expected in 0..SEMANTIC_QUEUE_DEPTH as i64 {
+            let received = receiver.recv().await.expect("sender remains open");
+            assert_eq!(received.frame_id, expected);
+        }
+        // The overflow frame was never enqueued — nothing else to receive.
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
