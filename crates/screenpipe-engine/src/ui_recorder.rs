@@ -893,7 +893,19 @@ pub async fn start_ui_recording(
 
                     if is_scroll {
                         if let Some(corr_id) = correlation_id {
-                            scroll_burst.record(corr_id);
+                            // Only the burst's tail corr id ever gets a
+                            // CaptureTrigger (ScrollStop, below); this one
+                            // superseded the previous tail, which now never
+                            // will. Release it now rather than let it sit in
+                            // the linker until TTL — see `record`'s doc.
+                            if let Some(superseded) = scroll_burst.record(corr_id) {
+                                if let Some(ref linker) = linker_tx {
+                                    let _ = linker.try_send(LinkerMessage::TriggerDropped {
+                                        correlation_ids: vec![superseded],
+                                        reason: crate::frame_linker::DropReason::Other,
+                                    });
+                                }
+                            }
                         }
                     } else if let (Some(ref trigger_tx), Some(trigger)) =
                         (&capture_trigger_tx, trigger_kind)
@@ -1272,9 +1284,15 @@ impl ScrollBurstTracker {
     /// Record a Scroll event with its correlation id. The corr id
     /// overwrites any previous one — only the LAST scroll in the burst
     /// gets linked: its row points at the frame produced by ScrollStop.
-    fn record(&mut self, corr_id: CorrelationId) {
+    /// Returns the corr id this one replaced, if any: that superseded id
+    /// will never get a `CaptureTrigger` of its own (only the tail of a
+    /// burst fires ScrollStop), so the caller must report it dropped
+    /// immediately instead of leaving it to expire on the linker's 60s
+    /// TTL — every intermediate scroll in a burst otherwise leaks as an
+    /// unaccounted eviction (the residual the frame_linker WARN flags).
+    fn record(&mut self, corr_id: CorrelationId) -> Option<CorrelationId> {
         self.last_scroll_at = Some(std::time::Instant::now());
-        self.last_scroll_corr_id = Some(corr_id);
+        self.last_scroll_corr_id.replace(corr_id)
     }
 
     /// If a burst has settled, return the correlation id to fire a
@@ -1944,7 +1962,7 @@ mod scroll_burst_tests {
     #[test]
     fn fires_after_delay() {
         let mut t = ScrollBurstTracker::new(Duration::from_millis(50));
-        t.record(7);
+        assert_eq!(t.record(7), None, "first scroll in a burst supersedes nothing");
         assert!(t.poll_burst_end().is_none(), "should not fire immediately");
         std::thread::sleep(Duration::from_millis(60));
         assert_eq!(t.poll_burst_end(), Some(7));
@@ -1955,9 +1973,9 @@ mod scroll_burst_tests {
     #[test]
     fn overwrites_within_burst() {
         let mut t = ScrollBurstTracker::new(Duration::from_millis(50));
-        t.record(1);
-        t.record(2);
-        t.record(3);
+        assert_eq!(t.record(1), None);
+        assert_eq!(t.record(2), Some(1), "2nd scroll supersedes the 1st");
+        assert_eq!(t.record(3), Some(2), "3rd scroll supersedes the 2nd");
         std::thread::sleep(Duration::from_millis(60));
         assert_eq!(t.poll_burst_end(), Some(3), "last corr id wins");
     }

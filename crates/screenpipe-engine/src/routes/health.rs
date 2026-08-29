@@ -366,6 +366,10 @@ pub struct HealthCheckResponse {
     /// distinctly from "off" so users can tell why ui_events stopped writing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui_recorder: Option<UiRecorderStatus>,
+    /// `ui_events.frame_id` linkage health. None only if the linker actor
+    /// was never spawned (should not happen in normal operation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_linker: Option<FrameLinkerHealthInfo>,
     /// Recording-coverage reliability metric: what fraction of the user's
     /// working time (recent input) had healthy screen capture. None until the
     /// sampler has accumulated any active or idle time.
@@ -528,6 +532,27 @@ pub struct AudioPipelineHealthInfo {
     pub meeting_app: Option<String>,
 }
 
+/// `ui_events.frame_id` linkage health — was previously only visible by
+/// grepping the periodic frame_linker WARN out of logs. `evicted_ttl` minus
+/// the `dropped_*` reasons is the *unaccounted* residual the WARN calls out;
+/// a growing gap there (not explained by DRM/pause/lag/capture-error) means
+/// some path is minting correlation ids that never reach the linker's known
+/// drop sites.
+#[derive(Serialize, OaSchema, Deserialize, Clone)]
+pub struct FrameLinkerHealthInfo {
+    pub pairs_emitted: u64,
+    pub updates_failed: u64,
+    pub evicted_ttl: u64,
+    pub dropped_drm: u64,
+    pub dropped_paused: u64,
+    pub dropped_lagged: u64,
+    pub dropped_capture_error: u64,
+    pub dropped_other: u64,
+    /// `evicted_ttl - sum(dropped_*)`. Should stay ~0; the WARN in the logs
+    /// is this same computation surfaced as it happens.
+    pub unaccounted_residual: u64,
+}
+
 /// Hard ceiling on /health response time. The endpoint is on the path of
 /// the desktop tray, the meeting bar, the device watcher, and user-written
 /// launchd watchdogs — none of which expect it to stall. If
@@ -666,6 +691,7 @@ fn degraded_response() -> HealthCheckResponse {
         audio_pipeline: None,
         accessibility: None,
         ui_recorder: None,
+        frame_linker: None,
         recording_coverage: None,
         pool_stats: None,
         write_queue_degraded: false,
@@ -1457,6 +1483,31 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
                 None
             }
         },
+        frame_linker: {
+            let m = crate::frame_linker_actor::linker_metrics_snapshot();
+            let dropped_sum = m.dropped_drm
+                + m.dropped_paused
+                + m.dropped_lagged
+                + m.dropped_capture_error
+                + m.dropped_other;
+            // Only attach once the linker has actually seen traffic —
+            // otherwise it's an all-zero row for users with no monitors.
+            if m.pairs_emitted > 0 || m.evicted_ttl > 0 {
+                Some(FrameLinkerHealthInfo {
+                    pairs_emitted: m.pairs_emitted,
+                    updates_failed: m.updates_failed,
+                    evicted_ttl: m.evicted_ttl,
+                    dropped_drm: m.dropped_drm,
+                    dropped_paused: m.dropped_paused,
+                    dropped_lagged: m.dropped_lagged,
+                    dropped_capture_error: m.dropped_capture_error,
+                    dropped_other: m.dropped_other,
+                    unaccounted_residual: m.evicted_ttl.saturating_sub(dropped_sum),
+                })
+            } else {
+                None
+            }
+        },
         recording_coverage: {
             let snap = coverage_snapshot();
             // Only attach once the sampler has observed any wall-clock time —
@@ -1743,6 +1794,7 @@ mod tests {
             audio_pipeline: None,
             accessibility: None,
             ui_recorder: None,
+            frame_linker: None,
             recording_coverage: None,
             pool_stats: None,
             write_queue_degraded: false,
