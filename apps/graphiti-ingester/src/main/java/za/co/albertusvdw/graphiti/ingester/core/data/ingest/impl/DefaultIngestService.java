@@ -148,11 +148,9 @@ public class DefaultIngestService implements IngestService {
             }
         }
 
-        if (ledgerRow.getAttempts() > graphitiProperties.getMaxAttempts()) {
-            log.warn(
-                    "episode '{}' exhausted its {} attempt(s), parking as failed",
-                    episode.name(),
-                    graphitiProperties.getMaxAttempts());
+        int attemptBudget = attemptBudgetFor(groupId);
+        if (ledgerRow.getAttempts() > attemptBudget) {
+            log.warn("episode '{}' exhausted its {} attempt(s), parking as failed", episode.name(), attemptBudget);
             ledger.markFailed(ledgerRow.getId(), IngestStatus.FAILED, "attempt budget exhausted");
             return IngestStatus.FAILED;
         }
@@ -196,6 +194,18 @@ public class DefaultIngestService implements IngestService {
         ledger.markFailed(
                 ledgerRow.getId(), IngestStatus.DROPPED, "not confirmed within " + budgetSeconds + "s");
         return IngestStatus.DROPPED;
+    }
+
+    /**
+     * How many claims an episode gets before it is parked as failed. Separate from the retries
+     * inside {@link #postWithBackoff}, which cover transient transport errors within one claim;
+     * this budget counts whole post-and-confirm rounds across runs. See
+     * {@link IngestProperties#getUnclassifiedMaxAttempts()} for why unclassified gets fewer.
+     */
+    private int attemptBudgetFor(String groupId) {
+        return groupId.equals(ingestProperties.getUnclassifiedGroupId())
+                ? ingestProperties.getUnclassifiedMaxAttempts()
+                : graphitiProperties.getMaxAttempts();
     }
 
     /** Posts, retrying only on failures that could plausibly succeed next time. */

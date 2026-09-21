@@ -37,6 +37,10 @@ ingest:
   # safely under that rather than at the model's hard context ceiling.
   max-episode-body-chars: ${INGEST_MAX_EPISODE_BODY_CHARS:8000}
   min-episode-body-chars: 40
+  # Posts an unclassified episode gets before it is parked as failed (the other partitions
+  # use graphiti.max-attempts). Unclassified content mostly draws empty or malformed model
+  # responses, and each failed attempt stalls the serial run for the full confirm budget.
+  unclassified-max-attempts: ${INGEST_UNCLASSIFIED_MAX_ATTEMPTS:1}
   batch-size: 500
   schedule:
     enabled: ${INGEST_SCHEDULE_ENABLED:true}
