@@ -43,6 +43,20 @@ public class IngestProperties {
     @NotBlank
     private String unclassifiedGroupId = "screenpipe-unclassified";
 
+    /**
+     * How many times an episode routed to the unclassified partition is posted before it is
+     * parked as failed. The other partitions use {@code graphiti.max-attempts}.
+     *
+     * <p>Lower on purpose. Unclassified activity is the noisiest content (chat servers, inbox
+     * lists, documents in protected view) and the extraction model answers it with an empty or
+     * malformed response far more often than it does work content — measured at roughly one
+     * success in seven, against six in seven for the work partition. Every failed attempt also
+     * holds the serial run for the whole confirm budget, so retrying these delays the episodes
+     * that do extract. One attempt still lets the ones that succeed through.
+     */
+    @Min(1)
+    private int unclassifiedMaxAttempts = 1;
+
     /** The single place that turns a domain decision into the partition it gets posted to. */
     public String groupIdFor(ActivityDomain domain) {
         return switch (domain) {
