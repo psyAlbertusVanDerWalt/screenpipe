@@ -6,6 +6,15 @@ import { localFetch } from "@/lib/api";
 
 export async function getStartDate() {
 	try {
+		// CROSS JOIN (not plain JOIN) is deliberate: it stops SQLite's optimizer
+		// from reordering the join. With a plain JOIN, the planner drives from
+		// video_chunks (cheap-looking since it's the smaller table) and defers
+		// the frames.timestamp filter, which forces a full materialize-and-sort
+		// of every joined row before LIMIT 1 can apply — measured at 18s+ against
+		// a ~200k-row frames table in production (fork issue: app hang while this
+		// query held the UI thread). CROSS JOIN forces frames to drive the scan,
+		// letting idx_frames_timestamp satisfy the ORDER BY directly so LIMIT 1
+		// short-circuits after the first matching row instead of scanning everything.
 		const videoChunkQuery = `
          SELECT
             f.timestamp,
@@ -16,7 +25,7 @@ export async function getStartDate() {
             vc.device_name as screen_device,
             vc.file_path as video_path
          FROM frames f
-         JOIN video_chunks vc ON f.video_chunk_id = vc.id
+         CROSS JOIN video_chunks vc ON f.video_chunk_id = vc.id
          ORDER BY f.timestamp ASC, f.offset_index ASC
          LIMIT 1
 
