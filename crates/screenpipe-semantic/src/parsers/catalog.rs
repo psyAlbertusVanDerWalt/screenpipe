@@ -188,7 +188,7 @@ pub static BUILTIN_APP_PROFILES: &[BuiltinAppProfile] = &[
         "Discord",
         &[C],
         &["com.hnc.Discord"],
-        &["Discord", "Discord.exe", "discord"],
+        &["Discord", "Discord.exe", "discord", "DiscordCanary.exe"],
         &[],
         &[],
         None,
@@ -694,4 +694,40 @@ pub(crate) fn contains_ascii_case_insensitive(value: &str, needle: &str) -> bool
         .as_bytes()
         .windows(needle.len())
         .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn windows_app(executable: &str) -> AppIdentity {
+        AppIdentity {
+            platform: Platform::Windows,
+            app_id: None,
+            executable: Some(executable.into()),
+            display_name: "Discord".into(),
+            version: None,
+            browser_url: None,
+        }
+    }
+
+    #[test]
+    fn discord_canary_resolves_to_the_discord_profile() {
+        // Canary is the same Electron app under a different executable name.
+        // Without this alias none of its frames ever reach the conversation
+        // parser (observed: ~22k Canary frames, zero semantic runs).
+        let app =
+            windows_app(r"C:\Users\u\AppData\Local\DiscordCanary\app-1.0.1\DiscordCanary.exe");
+        let profile =
+            profile_for(AppFamily::Conversation, &app).expect("Canary should match a profile");
+        assert_eq!(profile.id, "discord");
+    }
+
+    #[test]
+    fn stable_discord_still_resolves_to_the_discord_profile() {
+        let app = windows_app(r"C:\Users\u\AppData\Local\Discord\app-1.0.1\Discord.exe");
+        let profile =
+            profile_for(AppFamily::Conversation, &app).expect("Discord should match a profile");
+        assert_eq!(profile.id, "discord");
+    }
 }
