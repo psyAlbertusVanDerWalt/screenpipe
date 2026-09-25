@@ -82,5 +82,9 @@ jobs:
 
       - name: Deploy via Coolify
         run: |
-          curl -s -f "${{ vars.COOLIFY_URL }}/api/v1/deploy?uuid=${{ secrets.COOLIFY_APP_UUID }}&force=false" \
+          # POST, not GET: Coolify 4.2+ moved /deploy to POST, and this instance is on 4.3.
+          # --fail-with-body plus -w keeps the status code and error text in the job log;
+          # the old `-s -f` failed with a bare "exit code 22" and nothing to go on.
+          curl -sS --fail-with-body -X POST -w '\nHTTP %{http_code}\n' \
+            "${{ vars.COOLIFY_URL }}/api/v1/deploy?uuid=${{ secrets.COOLIFY_APP_UUID }}&force=false" \
             --header "Authorization: Bearer ${{ secrets.COOLIFY_API_TOKEN }}"
