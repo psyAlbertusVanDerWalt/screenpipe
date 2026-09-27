@@ -203,6 +203,10 @@ path = "src/bin/screenpipe-engine.rs"
 name = "screenpipe-export"
 path = "src/bin/screenpipe-export.rs"
 
+[[bin]]
+name = "screenpipe-redact-text"
+path = "src/bin/screenpipe-redact-text.rs"
+
 [[bench]]
 name = "hot_frame_cache"
 harness = false

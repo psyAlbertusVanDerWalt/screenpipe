@@ -242,7 +242,12 @@ impl RecordBuilder {
         }
     }
 
-    async fn redact_text(&self, text: &str) -> String {
+    /// Redact free text with this builder's pipeline and pseudonym key.
+    ///
+    /// Public so tools outside the export (the `screenpipe-redact-text` CLI)
+    /// produce the same `[PERSON_…]` tokens as the exported activity, which is
+    /// what lets their output link to the same entities in the graph.
+    pub async fn redact_text(&self, text: &str) -> String {
         match self.pipeline.redact(text).await {
             Ok(output) => output.redacted,
             // Redaction failing (e.g. a transient AI-adapter error, though
